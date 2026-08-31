@@ -65,10 +65,16 @@ const verifyOtp = async (req, res) => {
         await pool.query("UPDATE otp_codes SET is_used = TRUE WHERE id = $1", [otpRecord.rows[0].id]);
 
         const userResult = await pool.query(
-            "SELECT id, full_name, email, phone, role, status FROM users WHERE phone = $1",
+            "SELECT * FROM users WHERE phone = $1",
             [cleanPhone]
         );
+
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
         const user = userResult.rows[0];
+        delete user.password_hash;
 
         const accessToken = jwt.sign(
             { id: user.id, role: user.role },
@@ -83,7 +89,6 @@ const verifyOtp = async (req, res) => {
         res.status(500).json({ message: "Something went wrong while verifying OTP" });
     }
 };
-
 // ---------- EMAIL OTP ----------
 
 const sendEmailOtp = async (req, res) => {
