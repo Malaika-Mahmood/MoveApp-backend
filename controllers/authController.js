@@ -42,25 +42,25 @@ const findActiveRegistration = async (email) => {
 };
 
 // STEP 1 OF SIGN-UP
-// Collect the driver's details and email them a code.
-// Nothing is written to `users` yet — the account only exists once verified.
 const registerStart = async (req, res) => {
     try {
-        const { full_name, email, phone } = req.body;
+        const { first_name, middle_name, last_name, email, phone } = req.body;
 
-        if (!full_name || !email || !phone) {
+        if (!first_name || !last_name || !email || !phone) {
             return res.status(400).json({
-                message: "All fields are required: full_name, email, phone"
+                message: "All fields are required: first_name, last_name, email, phone"
             });
         }
 
-        const cleanName = String(full_name).trim();
+        const cleanFirstName = String(first_name).trim();
+        const cleanMiddleName = middle_name ? String(middle_name).trim() : null;
+        const cleanLastName = String(last_name).trim();
         const cleanEmail = String(email).trim();
         const cleanPhone = String(phone).trim();
 
-        if (cleanName.length < 2) {
+        if (cleanFirstName.length < 2 || cleanLastName.length < 2) {
             return res.status(400).json({
-                message: "full_name must be at least 2 characters"
+                message: "First and last name must be at least 2 characters"
             });
         }
 
@@ -88,7 +88,6 @@ const registerStart = async (req, res) => {
             });
         }
 
-        // Don't let anyone spam a stranger's inbox with codes
         const active = await findActiveRegistration(cleanEmail);
 
         if (active) {
@@ -101,7 +100,6 @@ const registerStart = async (req, res) => {
                 });
             }
 
-            // A new attempt supersedes the earlier one, so the old code stops working
             await pool.query(
                 "UPDATE pending_registrations SET consumed_at = NOW() WHERE id = $1",
                 [active.id]
@@ -110,13 +108,11 @@ const registerStart = async (req, res) => {
 
         const otp = generateOtp();
 
-        // Public sign-up creates drivers only. Operator accounts are assigned by
-        // the company directly, so `role` is never taken from the request body.
         await pool.query(
             `INSERT INTO pending_registrations
-                (full_name, email, phone, role, otp_hash, expires_at)
-             VALUES ($1, $2, $3, 'driver', $4, $5)`,
-            [cleanName, cleanEmail, cleanPhone, hashOtp(otp), otpExpiryDate()]
+                (first_name, middle_name, last_name, email, phone, role, otp_hash, expires_at)
+             VALUES ($1, $2, $3, $4, $5, 'driver', $6, $7)`,
+            [cleanFirstName, cleanMiddleName, cleanLastName, cleanEmail, cleanPhone, hashOtp(otp), otpExpiryDate()]
         );
 
         await sendEmailOtp(cleanEmail, otp);
@@ -137,7 +133,6 @@ const registerStart = async (req, res) => {
 };
 
 // STEP 2 OF SIGN-UP
-// Check the code, then create the account.
 const registerVerify = async (req, res) => {
     const client = await pool.connect();
 
@@ -173,8 +168,6 @@ const registerVerify = async (req, res) => {
 
             const remaining = MAX_VERIFY_ATTEMPTS - updated.rows[0].attempt_count;
 
-            // Burn the code once the attempt budget is gone, so a guessing script
-            // cannot keep working on the same 6 digits
             if (remaining <= 0) {
                 await pool.query(
                     "UPDATE pending_registrations SET consumed_at = NOW() WHERE id = $1",
@@ -192,17 +185,15 @@ const registerVerify = async (req, res) => {
             });
         }
 
-        // Correct code. Create the account and consume the request together, so a
-        // crash between the two cannot leave a code that works twice.
         await client.query("BEGIN");
 
         const newUser = await client.query(
             `INSERT INTO users
-                (full_name, email, phone, role, status, email_verified, phone_verified)
-             VALUES ($1, $2, $3, $4, 'account_created', TRUE, FALSE)
-             RETURNING id, full_name, email, phone, role, status,
+                (first_name, middle_name, last_name, email, phone, role, status, email_verified, phone_verified)
+             VALUES ($1, $2, $3, $4, $5, $6, 'account_created', TRUE, FALSE)
+             RETURNING id, first_name, middle_name, last_name, email, phone, role, status,
                        email_verified, phone_verified, created_at`,
-            [pending.full_name, pending.email, pending.phone, pending.role]
+            [pending.first_name, pending.middle_name, pending.last_name, pending.email, pending.phone, pending.role]
         );
 
         await client.query(
@@ -224,7 +215,6 @@ const registerVerify = async (req, res) => {
     } catch (error) {
         await client.query("ROLLBACK").catch(() => { });
 
-        // The unique indexes are the real guard against two simultaneous requests
         if (error.code === "23505") {
             return res.status(409).json({
                 message: "An account with this email or phone already exists"
@@ -241,7 +231,6 @@ const registerVerify = async (req, res) => {
     }
 };
 
-// Send the sign-up code again
 const registerResend = async (req, res) => {
     try {
         const { email } = req.body;
@@ -273,7 +262,6 @@ const registerResend = async (req, res) => {
             });
         }
 
-        // A new code replaces the old one, and the attempt budget resets with it
         const otp = generateOtp();
 
         await pool.query(
@@ -303,8 +291,6 @@ const registerResend = async (req, res) => {
     }
 };
 
-// Replaced by the two-step flow above. Kept so the frontend gets a clear
-// message instead of a confusing 404.
 const createAccount = async (req, res) => {
     res.status(410).json({
         message: "This endpoint has been replaced. Use POST /api/v1/auth/register/start, then POST /api/v1/auth/register/verify."
