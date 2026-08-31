@@ -29,14 +29,14 @@ const issueAccessToken = (user) => {
     );
 };
 
-// The most recent sign-up attempt for an email that has not been used or replaced
 const findActiveRegistration = async (email) => {
+    const cleanEmail = String(email).trim().toLowerCase();
     const result = await pool.query(
         `SELECT * FROM pending_registrations
-         WHERE LOWER(email) = LOWER($1) AND consumed_at IS NULL
+         WHERE LOWER(email) = $1 AND consumed_at IS NULL
          ORDER BY created_at DESC
          LIMIT 1`,
-        [email]
+        [cleanEmail]
     );
     return result.rows[0] || null;
 };
@@ -55,7 +55,7 @@ const registerStart = async (req, res) => {
         const cleanFirstName = String(first_name).trim();
         const cleanMiddleName = middle_name ? String(middle_name).trim() : null;
         const cleanLastName = String(last_name).trim();
-        const cleanEmail = String(email).trim();
+        const cleanEmail = String(email).trim().toLowerCase();
         const cleanPhone = String(phone).trim();
 
         if (cleanFirstName.length < 2 || cleanLastName.length < 2) {
@@ -76,9 +76,8 @@ const registerStart = async (req, res) => {
             });
         }
 
-        // Is this already a real account?
         const existingUser = await pool.query(
-            "SELECT id FROM users WHERE LOWER(email) = LOWER($1) OR phone = $2",
+            "SELECT id FROM users WHERE LOWER(email) = $1 OR phone = $2",
             [cleanEmail, cleanPhone]
         );
 
@@ -143,7 +142,10 @@ const registerVerify = async (req, res) => {
             return res.status(400).json({ message: "Email and OTP are required" });
         }
 
-        const pending = await findActiveRegistration(String(email).trim());
+        const cleanEmail = String(email).trim().toLowerCase();
+        const cleanOtp = String(otp).trim();
+
+        const pending = await findActiveRegistration(cleanEmail);
 
         if (!pending || new Date(pending.expires_at) <= new Date()) {
             return res.status(400).json({
@@ -157,7 +159,7 @@ const registerVerify = async (req, res) => {
             });
         }
 
-        if (!otpMatches(otp, pending.otp_hash)) {
+        if (!otpMatches(cleanOtp, pending.otp_hash)) {
             const updated = await pool.query(
                 `UPDATE pending_registrations
                  SET attempt_count = attempt_count + 1
@@ -239,7 +241,9 @@ const registerResend = async (req, res) => {
             return res.status(400).json({ message: "Email is required" });
         }
 
-        const pending = await findActiveRegistration(String(email).trim());
+        const cleanEmail = String(email).trim().toLowerCase();
+
+        const pending = await findActiveRegistration(cleanEmail);
 
         if (!pending) {
             return res.status(404).json({
