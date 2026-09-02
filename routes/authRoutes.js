@@ -7,14 +7,11 @@ const {
     registerResend,
     createAccount
 } = require("../controllers/authController");
-const { uploadDocument, getDriverDocuments, updateDriverDetails } = require("../controllers/documentController");
+const { deprecated } = require("../controllers/documentController");
 const { sendOtp, verifyOtp, sendEmailOtp, verifyEmailOtp } = require("../controllers/otpController");
 const { googleLogin } = require("../controllers/googleAuthController");
-const upload = require("../config/multerConfig");
 const rateLimit = require("../middleware/rateLimit");
 
-// Sending a code costs an email (and later, money per SMS), so throttle it
-// harder than verifying one.
 const sendCodeLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
@@ -32,23 +29,24 @@ router.post("/register/start", sendCodeLimiter, registerStart);
 router.post("/register/verify", verifyCodeLimiter, registerVerify);
 router.post("/register/resend", sendCodeLimiter, registerResend);
 
-// Deprecated — responds 410 pointing at the two-step flow above
-router.post("/create-account", createAccount);
+router.post("/create-account", createAccount);   // deprecated -> 410
 
 router.post("/google-login", googleLogin);
 
-// ---------- Driver documents / details ----------
-// NOTE: these still have no authentication. That lands in Step 3.
-router.post("/drivers/:id/documents", upload.single("file"), uploadDocument);
-router.get("/drivers/:id/documents", getDriverDocuments);
-router.patch("/drivers/:id/details", updateDriverDetails);
-
-// ---------- Phone login (hardening comes in Step 2) ----------
+// ---------- Phone login ----------
 router.post("/send-otp", sendOtp);
 router.post("/verify-otp", verifyOtp);
 
-// ---------- Email login (hardening comes in Step 2) ----------
+// ---------- Email login ----------
 router.post("/send-email-otp", sendEmailOtp);
 router.post("/verify-email-otp", verifyEmailOtp);
+
+// ---------- Moved ----------
+// Driver documents and details used to live under /auth, which was never the
+// right place, and they took the driver id from the URL. They are now under
+// /api/v1/drivers/me and read the id from the token.
+router.post("/drivers/:id/documents", deprecated);
+router.get("/drivers/:id/documents", deprecated);
+router.patch("/drivers/:id/details", deprecated);
 
 module.exports = router;

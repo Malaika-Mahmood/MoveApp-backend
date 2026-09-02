@@ -1,32 +1,33 @@
 const multer = require("multer");
-const path = require("path");
+const { ALLOWED_MIME_TYPES } = require("../utils/fileType");
 
-// Where to store files and what to name them
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, "uploads/"); // saves into the /uploads folder
-    },
-    filename: function (req, file, cb) {
-        // Example: 1735000000000-driving_licence.jpg
-        const uniqueSuffix = Date.now();
-        cb(null, `${uniqueSuffix}-${file.originalname}`);
-    }
-});
+// memoryStorage, not diskStorage.
+//
+// The file arrives as a Buffer and the controller hands it to storageService,
+// which decides where it actually goes. That is what lets local disk today
+// become Cloudinary tomorrow without touching any controller — and it is the
+// only option that can work on a read-only filesystem like Vercel's.
+//
+// 10 MB is small enough that holding it in memory is fine.
+const storage = multer.memoryStorage();
 
-// Only allow images and PDFs
+// First gate, based on what the client claims. The real check is in the
+// controller, which reads the file's actual first bytes.
 const fileFilter = (req, file, cb) => {
-    const allowedTypes = ["image/jpeg", "image/png", "image/jpg", "application/pdf"];
-    if (allowedTypes.includes(file.mimetype)) {
+    if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
         cb(null, true);
     } else {
-        cb(new Error("Only JPG, PNG, and PDF files are allowed"), false);
+        cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "file"), false);
     }
 };
 
 const upload = multer({
-    storage: storage,
-    fileFilter: fileFilter,
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB max per file
+    storage,
+    fileFilter,
+    limits: {
+        fileSize: 10 * 1024 * 1024,   // 10 MB
+        files: 1
+    }
 });
 
 module.exports = upload;
