@@ -39,16 +39,10 @@ const authenticate = async (req, res, next) => {
             });
         }
 
-        const result = await pool.query(
-            `SELECT id, title, first_name, middle_name, last_name, email, phone,
-                    role, status, email_verified, phone_verified,
-                    ni_number, postcode, address, driver_type, driver_type_confirmed,
-                    created_at
-             FROM users
-             WHERE id = $1`,
-            [payload.id]
-        );
-
+        // SELECT * rather than a column list: this row is what every /me
+        // response is built from, and a missing column here silently becomes
+        // a missing field in the API.
+        const result = await pool.query("SELECT * FROM users WHERE id = $1", [payload.id]);
         const user = result.rows[0];
 
         if (!user) {
@@ -65,6 +59,9 @@ const authenticate = async (req, res, next) => {
                 error_code: "ACCOUNT_SUSPENDED"
             });
         }
+
+        // Never let the password hash travel further into the request
+        delete user.password;
 
         req.user = user;
         next();

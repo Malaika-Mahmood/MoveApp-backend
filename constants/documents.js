@@ -35,6 +35,27 @@ const REQUIRED_VEHICLE_DOCUMENTS = [
 
 const ALL_VEHICLE_DOCUMENTS = [...REQUIRED_VEHICLE_DOCUMENTS];
 
+// Documents that carry an expiry date. The operator fills these in while
+// approving — they are reading the document anyway.
+//
+// A photo or a National Insurance card does not expire, so asking for a date
+// on those would just be noise.
+const DRIVER_DOCUMENTS_WITH_EXPIRY = [
+    "driving_licence_front",
+    "pco_licence_front",
+    "pco_paper_part"
+];
+
+const VEHICLE_DOCUMENTS_WITH_EXPIRY = [
+    "pco_vehicle_paper",
+    "mot_road_tax",
+    "car_insurance",
+    "valid_mot"
+];
+
+const documentNeedsExpiry = (type) =>
+    DRIVER_DOCUMENTS_WITH_EXPIRY.includes(type) || VEHICLE_DOCUMENTS_WITH_EXPIRY.includes(type);
+
 // Where the file came from on the phone
 const DOCUMENT_SOURCES = ["scan", "gallery", "pdf"];
 
@@ -69,6 +90,9 @@ module.exports = {
     ALL_DRIVER_DOCUMENTS,
     REQUIRED_VEHICLE_DOCUMENTS,
     ALL_VEHICLE_DOCUMENTS,
+    DRIVER_DOCUMENTS_WITH_EXPIRY,
+    VEHICLE_DOCUMENTS_WITH_EXPIRY,
+    documentNeedsExpiry,
     DOCUMENT_SOURCES,
     DOCUMENT_LABELS
 };
