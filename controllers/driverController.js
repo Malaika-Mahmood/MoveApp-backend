@@ -1,17 +1,5 @@
 const pool = require("../config/db");
 
-// UK National Insurance number, e.g. AB123456C
-//
-// Real rules, which are fussier than they look:
-//   - first letter cannot be D, F, I, Q, U or V
-//   - second letter cannot be D, F, I, O, Q, U or V
-//   - the prefixes BG, GB, KN, NK, NT, TN and ZZ are never issued
-//   - suffix is A, B, C or D
-//
-// Note QQ123456C is NOT valid — HMRC uses it in documentation precisely
-// because it can never be a real number, so it must not be shown as an example.
-const NI_REGEX = /^(?!BG|GB|KN|NK|NT|TN|ZZ)[A-CEGHJ-PR-TW-Z][A-CEGHJ-NPR-TW-Z]\d{6}[A-D]$/i;
-
 // UK postcode, e.g. W1U 3BW / SW1A 1AA / M1 1AE
 const POSTCODE_REGEX = /^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$/i;
 
@@ -21,6 +9,11 @@ const VALID_TITLES = ["Mr", "Mrs", "Ms"];
 const VALID_DRIVER_TYPES = ["internal", "external"];
 
 const MIN_DRIVER_AGE = 21;   // typical UK private hire minimum
+
+// NOTE: the National Insurance number is deliberately NOT collected here.
+// It is printed on the document the driver uploads, so the operator reads it
+// off that during verification (PATCH /operator/drivers/:id/details) rather
+// than making the driver type it twice.
 
 // Shape the frontend receives everywhere a driver profile is returned.
 // Keeping it in one function means every endpoint sends the same fields.
@@ -38,11 +31,14 @@ const toProfile = (u) => ({
     status: u.status,
     email_verified: u.email_verified,
     phone_verified: u.phone_verified,
-    ni_number: u.ni_number,
-    postcode: u.postcode,
     address: u.address,
+    postcode: u.postcode,
+
+    // Filled in by the operator from the documents — read-only to the driver
+    ni_number: u.ni_number,
     driving_licence_number: u.driving_licence_number,
     pco_licence_number: u.pco_licence_number,
+
     driver_type: u.driver_type,
     driver_type_confirmed: u.driver_type_confirmed,
     created_at: u.created_at,
@@ -50,13 +46,12 @@ const toProfile = (u) => ({
     // Onboarding progress, so the app knows which screen to show next
     // without having to work it out from null checks.
     onboarding: {
-        personal_info_complete: Boolean(u.title && u.ni_number && u.postcode && u.date_of_birth),
+        personal_info_complete: Boolean(u.title && u.date_of_birth && u.postcode),
         driver_type_selected: Boolean(u.driver_type)
     }
 });
 
 // GET /api/v1/drivers/me
-// Powers the auto-filled fields on the Personal Information screen.
 const getMe = async (req, res) => {
     try {
         // authenticate already loaded the row, so no second query is needed
@@ -68,12 +63,13 @@ const getMe = async (req, res) => {
 };
 
 // PATCH /api/v1/drivers/me/personal
-// Screen 2: title, date of birth, NI number, address, postcode.
-// Name, phone and email are shown read-only from getMe, so they are
-// deliberately not accepted here.
+// Title, date of birth, address, postcode.
+//
+// Editable at any time, including after approval — people move house, and
+// making them phone the operator for that would be silly.
 const updatePersonalInfo = async (req, res) => {
     try {
-        const { title, date_of_birth, ni_number, address, postcode } = req.body;
+        const { title, date_of_birth, address, postcode } = req.body;
 
         if (req.user.role !== "driver") {
             return res.status(403).json({
@@ -82,25 +78,13 @@ const updatePersonalInfo = async (req, res) => {
             });
         }
 
-        // Once an operator has approved this driver, their verified details
-        // must not change silently — an operator has to make the change.
-        if (req.user.status === "approved") {
-            return res.status(403).json({
-                message: "Your details are verified and can no longer be edited. Please contact the operator.",
-                error_code: "PROFILE_LOCKED"
-            });
-        }
-
-        if (!title || !date_of_birth || !ni_number || !postcode) {
+        if (!title || !date_of_birth || !postcode) {
             return res.status(400).json({
-                message: "title, date_of_birth, ni_number and postcode are all required"
+                message: "title, date_of_birth and postcode are required"
             });
         }
 
         const cleanTitle = String(title).trim();
-        // Stored without spaces and upper-cased so two people cannot register
-        // "ab 123456 c" and "AB123456C" as different numbers.
-        const cleanNi = String(ni_number).replace(/\s/g, "").toUpperCase();
         const cleanPostcode = String(postcode).trim().toUpperCase();
         const cleanAddress = address ? String(address).trim() : null;
 
@@ -121,8 +105,7 @@ const updatePersonalInfo = async (req, res) => {
             return res.status(400).json({ message: "date_of_birth is not a valid date" });
         }
 
-        const ageMs = Date.now() - dob.getTime();
-        const age = ageMs / (365.25 * 24 * 60 * 60 * 1000);
+        const age = (Date.now() - dob.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
 
         if (age < MIN_DRIVER_AGE) {
             return res.status(400).json({
@@ -135,12 +118,6 @@ const updatePersonalInfo = async (req, res) => {
             return res.status(400).json({ message: "date_of_birth does not look correct" });
         }
 
-        if (!NI_REGEX.test(cleanNi)) {
-            return res.status(400).json({
-                message: "ni_number must be a valid UK National Insurance number (e.g. AB123456C)"
-            });
-        }
-
         if (!POSTCODE_REGEX.test(cleanPostcode)) {
             return res.status(400).json({
                 message: "postcode must be a valid UK postcode (e.g. W1U 3BW)"
@@ -149,11 +126,11 @@ const updatePersonalInfo = async (req, res) => {
 
         const updated = await pool.query(
             `UPDATE users
-             SET title = $1, date_of_birth = $2, ni_number = $3,
-                 address = COALESCE($4, address), postcode = $5, updated_at = NOW()
-             WHERE id = $6
+             SET title = $1, date_of_birth = $2,
+                 address = COALESCE($3, address), postcode = $4, updated_at = NOW()
+             WHERE id = $5
              RETURNING *`,
-            [cleanTitle, date_of_birth, cleanNi, cleanAddress, cleanPostcode, req.user.id]
+            [cleanTitle, date_of_birth, cleanAddress, cleanPostcode, req.user.id]
         );
 
         res.status(200).json({
@@ -168,11 +145,10 @@ const updatePersonalInfo = async (req, res) => {
 };
 
 // PATCH /api/v1/drivers/me/type
-// Screen 3: internal (company) or external.
+// internal (company) or external.
 //
 // This is the driver's own claim. It does not change which documents are
-// required — every driver uploads their own — and the operator confirms or
-// corrects it during verification.
+// required — every driver uploads their own — and the operator confirms it.
 const updateDriverType = async (req, res) => {
     try {
         const { driver_type } = req.body;
@@ -181,13 +157,6 @@ const updateDriverType = async (req, res) => {
             return res.status(403).json({
                 message: "Only drivers have a driver type",
                 error_code: "FORBIDDEN"
-            });
-        }
-
-        if (req.user.status === "approved") {
-            return res.status(403).json({
-                message: "Your details are verified and can no longer be edited. Please contact the operator.",
-                error_code: "PROFILE_LOCKED"
             });
         }
 
@@ -203,19 +172,28 @@ const updateDriverType = async (req, res) => {
             });
         }
 
-        // Changing the claim clears any previous operator confirmation,
-        // so a confirmed "external" cannot quietly become "internal".
+        // Changing the claim clears the operator's confirmation, so a confirmed
+        // "external" cannot quietly become "internal". An already-approved
+        // driver goes back into the queue, because approval depended on the
+        // operator having confirmed the old value.
         const updated = await pool.query(
             `UPDATE users
-             SET driver_type = $1, driver_type_confirmed = FALSE, updated_at = NOW()
+             SET driver_type = $1,
+                 driver_type_confirmed = FALSE,
+                 status = CASE WHEN status = 'approved' THEN 'pending_verification' ELSE status END,
+                 updated_at = NOW()
              WHERE id = $2
              RETURNING *`,
             [cleanType, req.user.id]
         );
 
+        const user = updated.rows[0];
+
         res.status(200).json({
-            message: "Driver type saved",
-            user: toProfile(updated.rows[0])
+            message: req.user.status === "approved" && user.status === "pending_verification"
+                ? "Driver type saved. An operator needs to confirm the change before you are approved again."
+                : "Driver type saved",
+            user: toProfile(user)
         });
 
     } catch (error) {

@@ -18,6 +18,31 @@ const TOKEN_EXPIRY = "7d";
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_REGEX = /^\+?[0-9\s\-()]{7,20}$/;
 
+// Operators use exactly the same sign-up flow as drivers — no credentials are
+// handed out — but only from a company email address.
+//
+// Without this restriction anyone could send role: "operator", then approve
+// their own documents and become a verified driver. The whole verification
+// system rests on this one check.
+//
+// Set OPERATOR_EMAIL_DOMAINS in .env (comma-separated for more than one).
+const OPERATOR_EMAIL_DOMAINS = (process.env.OPERATOR_EMAIL_DOMAINS || "eurocarslondon.co.uk")
+    .split(",")
+    .map((d) => d.trim().toLowerCase().replace(/^@/, ""))
+    .filter(Boolean);
+
+if (!process.env.OPERATOR_EMAIL_DOMAINS) {
+    console.warn(
+        `[auth] OPERATOR_EMAIL_DOMAINS is not set — falling back to: ${OPERATOR_EMAIL_DOMAINS.join(", ")}`
+    );
+}
+
+const isCompanyEmail = (email) => {
+    const at = String(email).lastIndexOf("@");
+    if (at === -1) return false;
+    return OPERATOR_EMAIL_DOMAINS.includes(String(email).slice(at + 1).toLowerCase());
+};
+
 const issueAccessToken = (user) => {
     if (!process.env.JWT_SECRET) {
         throw new Error("JWT_SECRET is not set in the environment");
@@ -44,7 +69,7 @@ const findActiveRegistration = async (email) => {
 // STEP 1 OF SIGN-UP
 const registerStart = async (req, res) => {
     try {
-        const { first_name, middle_name, last_name, email, phone } = req.body;
+        const { first_name, middle_name, last_name, email, phone, role } = req.body;
 
         if (!first_name || !last_name || !email || !phone) {
             return res.status(400).json({
@@ -57,6 +82,22 @@ const registerStart = async (req, res) => {
         const cleanLastName = String(last_name).trim();
         const cleanEmail = String(email).trim().toLowerCase();
         const cleanPhone = String(phone).trim();
+
+        // Defaults to driver, so the app does not have to send anything
+        const requestedRole = role ? String(role).trim().toLowerCase() : "driver";
+
+        if (!["driver", "operator"].includes(requestedRole)) {
+            return res.status(400).json({
+                message: "role must be either 'driver' or 'operator'"
+            });
+        }
+
+        if (requestedRole === "operator" && !isCompanyEmail(cleanEmail)) {
+            return res.status(403).json({
+                message: "Operator accounts can only be created with a company email address",
+                error_code: "OPERATOR_EMAIL_REQUIRED"
+            });
+        }
 
         if (cleanFirstName.length < 2 || cleanLastName.length < 2) {
             return res.status(400).json({
@@ -110,8 +151,9 @@ const registerStart = async (req, res) => {
         await pool.query(
             `INSERT INTO pending_registrations
                 (first_name, middle_name, last_name, email, phone, role, otp_hash, expires_at)
-             VALUES ($1, $2, $3, $4, $5, 'driver', $6, $7)`,
-            [cleanFirstName, cleanMiddleName, cleanLastName, cleanEmail, cleanPhone, hashOtp(otp), otpExpiryDate()]
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [cleanFirstName, cleanMiddleName, cleanLastName, cleanEmail, cleanPhone,
+                requestedRole, hashOtp(otp), otpExpiryDate()]
         );
 
         await sendEmailOtp(cleanEmail, otp);
@@ -119,6 +161,7 @@ const registerStart = async (req, res) => {
         res.status(200).json({
             message: "Verification code sent to your email",
             email: cleanEmail,
+            role: requestedRole,
             expires_in_minutes: OTP_TTL_MINUTES,
             ...(shouldExposeOtp() ? { dev_otp: otp } : {})
         });
@@ -187,15 +230,22 @@ const registerVerify = async (req, res) => {
             });
         }
 
+        // An operator's email domain was already checked at registerStart, and
+        // they have no documents to submit, so they start ready to work.
+        // A driver starts at the beginning of onboarding.
+        const initialStatus = pending.role === "operator" ? "approved" : "account_created";
+
         await client.query("BEGIN");
 
         const newUser = await client.query(
             `INSERT INTO users
-                (first_name, middle_name, last_name, email, phone, role, status, email_verified, phone_verified)
-             VALUES ($1, $2, $3, $4, $5, $6, 'account_created', TRUE, FALSE)
+                (first_name, middle_name, last_name, email, phone, role, status,
+                 email_verified, phone_verified)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, FALSE)
              RETURNING id, first_name, middle_name, last_name, email, phone, role, status,
                        email_verified, phone_verified, created_at`,
-            [pending.first_name, pending.middle_name, pending.last_name, pending.email, pending.phone, pending.role]
+            [pending.first_name, pending.middle_name, pending.last_name,
+            pending.email, pending.phone, pending.role, initialStatus]
         );
 
         await client.query(
@@ -242,7 +292,6 @@ const registerResend = async (req, res) => {
         }
 
         const cleanEmail = String(email).trim().toLowerCase();
-
         const pending = await findActiveRegistration(cleanEmail);
 
         if (!pending) {
