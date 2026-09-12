@@ -2,11 +2,17 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const pool = require("./config/db");
+
 const authRoutes = require("./routes/authRoutes");
 const driverRoutes = require("./routes/driverRoutes");
-const documentRoutes = require("./routes/documentRoutes");
+const operatorProfileRoutes = require("./routes/operatorProfileRoutes");
 const operatorRoutes = require("./routes/operatorRoutes");
+const adminRoutes = require("./routes/adminRoutes");
+const documentRoutes = require("./routes/documentRoutes");
 const vehicleRoutes = require("./routes/vehicleRoutes");
+const notificationRoutes = require("./routes/notificationRoutes");
+const cronRoutes = require("./routes/cronRoutes");
+
 const app = express();
 
 // Needed for req.ip to be the real client behind Vercel's proxy, which the
@@ -14,19 +20,40 @@ const app = express();
 app.set("trust proxy", 1);
 
 app.use(cors());
-app.use((req, res, next) => { console.log("→", req.method, req.originalUrl); next(); });
 app.use(express.json());
 
 app.use("/api/v1/auth", authRoutes);
+
+// Drivers
 app.use("/api/v1/drivers", driverRoutes);
-app.use("/api/v1/documents", documentRoutes);
-app.use("/api/v1/operator", operatorRoutes);
 app.use("/api/v1/vehicles", vehicleRoutes);
+
+// Operators
+//   /operators  — the operator's own onboarding, reviewed by an admin
+//   /operator   — the work an approved operator does on drivers
+app.use("/api/v1/operators", operatorProfileRoutes);
+app.use("/api/v1/operator", operatorRoutes);
+
+// Admins
+app.use("/api/v1/admin", adminRoutes);
+
+// Files
+app.use("/api/v1/documents", documentRoutes);
+
+// The bell icon — every role uses the same three endpoints
+app.use("/api/v1/notifications", notificationRoutes);
+
+// Scheduled jobs.
+//
+// Deliberately NOT behind authenticate/authorize: a scheduler has no login and
+// cannot obtain a JWT. It carries CRON_SECRET instead, which the route checks
+// itself. Nothing else is mounted here — one job, one secret, no surface.
+app.use("/api/v1/cron", cronRoutes);
 
 // NOTE: app.use("/uploads", express.static("uploads")) has been REMOVED.
 // It made every passport, licence and National Insurance document downloadable
 // by anyone who guessed a filename. Files now go through
-// GET /api/v1/documents/:id/file, which checks who is asking.
+// GET /api/v1/documents/..., which checks who is asking.
 
 app.get("/", (req, res) => {
     res.json({

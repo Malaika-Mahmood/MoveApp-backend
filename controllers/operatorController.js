@@ -3,15 +3,22 @@ const { toDocument } = require("./documentController");
 const { toVehicleDocument } = require("./vehicleController");
 const {
     REQUIRED_DRIVER_DOCUMENTS,
-    OPTIONAL_DRIVER_DOCUMENTS,
     REQUIRED_VEHICLE_DOCUMENTS,
     DRIVER_DOCUMENTS_WITH_EXPIRY,
     VEHICLE_DOCUMENTS_WITH_EXPIRY,
     documentNeedsExpiry,
     DOCUMENT_LABELS
 } = require("../constants/documents");
+const { maskDriverContact } = require("../utils/masking");
+const {
+    notifyDocumentsViewed,
+    notifyExpiryLockCleared
+} = require("../services/appNotifications");
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+// UK National Insurance number, e.g. AB123456C
+const NI_REGEX = /^(?!BG|GB|KN|NK|NT|TN|ZZ)[A-CEGHJ-PR-TW-Z][A-CEGHJ-NPR-TW-Z]\d{6}[A-D]$/i;
 
 const parseExpiryDate = (value) => {
     if (!ISO_DATE.test(String(value))) return null;
@@ -51,14 +58,25 @@ const recomputeVehicleStatus = async (client, vehicleId) => {
 
 const recomputeDriverStatus = async (client, driverId) => {
     const userResult = await client.query(
-        "SELECT status, driver_type_confirmed FROM users WHERE id = $1",
+        "SELECT status, suspension_reason FROM users WHERE id = $1",
         [driverId]
     );
     const user = userResult.rows[0];
     if (!user) return null;
 
-    // A suspension is an operator decision, not something documents can undo
-    if (user.status === "suspended") return "suspended";
+    // There are two kinds of suspension and they behave differently.
+    //
+    //   - An operator or admin suspension is somebody's decision. No amount of
+    //     document approving undoes it; only that person can lift it.
+    //
+    //   - A document_expired suspension is a fact about a date. It IS undone by
+    //     documents — but only once the replacement has actually been approved,
+    //     never merely uploaded. That is why it is cleared here rather than at
+    //     upload time.
+    const lockedForExpiry =
+        user.status === "suspended" && user.suspension_reason === "document_expired";
+
+    if (user.status === "suspended" && !lockedForExpiry) return "suspended";
 
     const docs = await client.query(
         "SELECT document_type, status FROM driver_documents WHERE user_id = $1 AND is_current",
@@ -82,14 +100,37 @@ const recomputeDriverStatus = async (client, driverId) => {
     if (anyDocRejected || anyVehicleRejected) {
         // Something needs re-uploading — the driver must be told
         status = "rejected";
-    } else if (allApproved && hasApprovedVehicle && user.driver_type_confirmed) {
-        // Everything required: all 10 documents, one fully approved vehicle,
-        // and the operator has confirmed internal vs external
+    } else if (allApproved && hasApprovedVehicle) {
+        // Everything required: all required documents approved, and one
+        // fully approved vehicle
         status = "approved";
     } else if (allPresent && vehicles.rows.length > 0) {
         status = "pending_verification";
     } else {
         status = "account_created";
+    }
+
+    // The lock only lifts on a clean bill of health: every required document
+    // approved AND an approved vehicle. Anything short of that — one document
+    // still waiting for review, a rejected file, no vehicle — and the driver
+    // stays suspended, with the row left exactly as it is.
+    if (lockedForExpiry && status !== "approved") {
+        return "suspended";
+    }
+
+    if (lockedForExpiry) {
+        await client.query(
+            `UPDATE users
+             SET status = $1,
+                 suspension_reason = NULL,
+                 suspended_at = NULL,
+                 updated_at = NOW()
+             WHERE id = $2`,
+            [status, driverId]
+        );
+
+        await notifyExpiryLockCleared(driverId);
+        return status;
     }
 
     await client.query(
@@ -114,25 +155,56 @@ const getPendingDrivers = async (req, res) => {
         const allowed = ["pending_verification", "account_created", "approved", "rejected", "suspended"];
         const status = allowed.includes(req.query.status) ? req.query.status : "pending_verification";
 
+        // The default queue ("who is waiting for me?") has to include one case
+        // that does not look like it belongs: a driver suspended for an expired
+        // document who has since uploaded a replacement. Their status is
+        // 'suspended', so a plain status filter would hide them — and nobody
+        // would ever approve the new file, which leaves the driver locked out
+        // for good through no fault of their own.
+        //
+        // The condition is narrow on purpose: only a document_expired lock, and
+        // only when there is actually something new sitting in the queue.
+        const includeAwaitingReview = status === "pending_verification";
+
+        const filter = includeAwaitingReview
+            ? `(
+                 u.status = $1
+                 OR (
+                   u.status = 'suspended'
+                   AND u.suspension_reason = 'document_expired'
+                   AND EXISTS (
+                     SELECT 1 FROM driver_documents d
+                     WHERE d.user_id = u.id
+                       AND d.is_current
+                       AND d.status = 'pending_review'
+                   )
+                 )
+               )`
+            : "u.status = $1";
+
         const drivers = await pool.query(
-            `SELECT id, title, first_name, middle_name, last_name, email, phone,
-                    date_of_birth, ni_number, postcode, address,
-                    driver_type, driver_type_confirmed, status, created_at
-             FROM users
-             WHERE role = 'driver' AND status = $1
-             ORDER BY created_at ASC
+            `SELECT u.id, u.title, u.first_name, u.middle_name, u.last_name,
+                    u.email, u.phone, u.date_of_birth, u.ni_number, u.postcode,
+                    u.address, u.status, u.suspension_reason, u.created_at
+             FROM users u
+             WHERE u.role = 'driver' AND ${filter}
+             ORDER BY u.created_at ASC
              LIMIT $2 OFFSET $3`,
             [status, limit, offset]
         );
 
         const count = await pool.query(
-            "SELECT COUNT(*)::int AS total FROM users WHERE role = 'driver' AND status = $1",
+            `SELECT COUNT(*)::int AS total
+             FROM users u
+             WHERE u.role = 'driver' AND ${filter}`,
             [status]
         );
         const total = count.rows[0].total;
 
         res.status(200).json({
-            drivers: drivers.rows,
+            // The columns are still selected, because the same query serves an
+            // admin one day; masking decides what LEAVES the server.
+            drivers: drivers.rows.map((d) => maskDriverContact(d, req.user.role)),
             pagination: {
                 page,
                 limit,
@@ -182,8 +254,19 @@ const getDriverDetail = async (req, res) => {
 
         const have = docs.rows.map((d) => d.document_type);
 
+        // Tell the driver their pack was opened. Only an operator triggers
+        // this: an admin reviewing a record for compliance is not something the
+        // driver is notified about, and notifyDocumentsViewed already ignores a
+        // driver looking at their own.
+        //
+        // Not awaited, and it can never throw — a failed notification must not
+        // stop the operator seeing the documents.
+        if (req.user.role === "operator") {
+            notifyDocumentsViewed(driver.id, req.user.id);
+        }
+
         res.status(200).json({
-            driver: {
+            driver: maskDriverContact({
                 id: driver.id,
                 title: driver.title,
                 first_name: driver.first_name,
@@ -199,11 +282,9 @@ const getDriverDetail = async (req, res) => {
                 postcode: driver.postcode,
                 driving_licence_number: driver.driving_licence_number,
                 pco_licence_number: driver.pco_licence_number,
-                driver_type: driver.driver_type,
-                driver_type_confirmed: driver.driver_type_confirmed,
                 status: driver.status,
                 created_at: driver.created_at
-            },
+            }, req.user.role),
 
             documents: docs.rows.map(toDocument),
             missing_documents: REQUIRED_DRIVER_DOCUMENTS.filter((t) => !have.includes(t)),
@@ -403,8 +484,8 @@ const verifyVehicleDocument = async (req, res) => {
 // -----------------------------------------------------------------------------
 
 // PATCH /api/v1/operator/drivers/:id/details
-// Licence numbers, date of birth, address — the operator has the documents in
-// front of them, so they type these rather than the driver.
+// NI number, licence numbers, date of birth, address — the operator has the
+// documents in front of them, so they type these rather than the driver.
 const updateDriverDetails = async (req, res) => {
     try {
         const { id } = req.params;
@@ -412,16 +493,26 @@ const updateDriverDetails = async (req, res) => {
             return res.status(400).json({ message: "Invalid driver id" });
         }
 
-        const { driving_licence_number, pco_licence_number, date_of_birth, address } = req.body;
+        const { ni_number, driving_licence_number, pco_licence_number, date_of_birth, address } = req.body;
 
-        if (!driving_licence_number && !pco_licence_number && !date_of_birth && !address) {
+        if (!ni_number && !driving_licence_number && !pco_licence_number && !date_of_birth && !address) {
             return res.status(400).json({
-                message: "Provide at least one of: driving_licence_number, pco_licence_number, date_of_birth, address"
+                message: "Provide at least one of: ni_number, driving_licence_number, pco_licence_number, date_of_birth, address"
             });
         }
 
         if (date_of_birth && !parseExpiryDate(date_of_birth)) {
             return res.status(400).json({ message: "date_of_birth must be in YYYY-MM-DD format" });
+        }
+
+        // Stored without spaces and upper-cased so the same number cannot be
+        // entered two different ways
+        const cleanNi = ni_number ? String(ni_number).replace(/\s/g, "").toUpperCase() : null;
+
+        if (cleanNi && !NI_REGEX.test(cleanNi)) {
+            return res.status(400).json({
+                message: "ni_number must be a valid UK National Insurance number (e.g. AB123456C)"
+            });
         }
 
         // PCO/PHV licence numbers are numeric, typically 5-8 digits
@@ -431,15 +522,17 @@ const updateDriverDetails = async (req, res) => {
 
         const updated = await pool.query(
             `UPDATE users
-             SET driving_licence_number = COALESCE($1, driving_licence_number),
-                 pco_licence_number     = COALESCE($2, pco_licence_number),
-                 date_of_birth          = COALESCE($3, date_of_birth),
-                 address                = COALESCE($4, address),
+             SET ni_number              = COALESCE($1, ni_number),
+                 driving_licence_number = COALESCE($2, driving_licence_number),
+                 pco_licence_number     = COALESCE($3, pco_licence_number),
+                 date_of_birth          = COALESCE($4, date_of_birth),
+                 address                = COALESCE($5, address),
                  updated_at             = NOW()
-             WHERE id = $5 AND role = 'driver'
-             RETURNING id, first_name, last_name, date_of_birth, address, postcode,
+             WHERE id = $6 AND role = 'driver'
+             RETURNING id, first_name, last_name, date_of_birth, ni_number, address, postcode,
                        driving_licence_number, pco_licence_number, status`,
             [
+                cleanNi,
                 driving_licence_number ? String(driving_licence_number).trim().toUpperCase() : null,
                 pco_licence_number ? String(pco_licence_number).trim() : null,
                 date_of_birth || null,
@@ -460,58 +553,6 @@ const updateDriverDetails = async (req, res) => {
     } catch (error) {
         console.error("Error in updateDriverDetails:", error);
         res.status(500).json({ message: "Something went wrong while updating driver details" });
-    }
-};
-
-// PATCH /api/v1/operator/drivers/:id/type
-// The driver claims internal or external; this is the operator confirming it.
-// A driver cannot be approved until it has been confirmed.
-const confirmDriverType = async (req, res) => {
-    const client = await pool.connect();
-
-    try {
-        const { id } = req.params;
-        const { driver_type } = req.body;
-
-        if (!/^\d+$/.test(id)) {
-            return res.status(400).json({ message: "Invalid driver id" });
-        }
-
-        if (!["internal", "external"].includes(driver_type)) {
-            return res.status(400).json({ message: "driver_type must be 'internal' or 'external'" });
-        }
-
-        await client.query("BEGIN");
-
-        const updated = await client.query(
-            `UPDATE users
-             SET driver_type = $1, driver_type_confirmed = TRUE, updated_at = NOW()
-             WHERE id = $2 AND role = 'driver'
-             RETURNING id, driver_type, driver_type_confirmed`,
-            [driver_type, id]
-        );
-
-        if (updated.rows.length === 0) {
-            await client.query("ROLLBACK");
-            return res.status(404).json({ message: "Driver not found" });
-        }
-
-        const driverStatus = await recomputeDriverStatus(client, id);
-
-        await client.query("COMMIT");
-
-        res.status(200).json({
-            message: "Driver type confirmed",
-            driver: updated.rows[0],
-            driver_status: driverStatus
-        });
-
-    } catch (error) {
-        await client.query("ROLLBACK").catch(() => { });
-        console.error("Error in confirmDriverType:", error);
-        res.status(500).json({ message: "Something went wrong while confirming the driver type" });
-    } finally {
-        client.release();
     }
 };
 
@@ -609,13 +650,14 @@ const setDriverSuspension = async (req, res) => {
     }
 };
 
+// REMOVED: confirmDriverType — internal vs external no longer exists.
+
 module.exports = {
     getPendingDrivers,
     getDriverDetail,
     verifyDriverDocument,
     verifyVehicleDocument,
     updateDriverDetails,
-    confirmDriverType,
     updateVehicleDetails,
     setDriverSuspension,
     recomputeDriverStatus,

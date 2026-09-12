@@ -53,12 +53,31 @@ const authenticate = async (req, res, next) => {
             });
         }
 
-        if (user.status === "suspended") {
+        // A suspended account is normally turned away here.
+        //
+        // One case is different: a driver suspended because a document expired.
+        // They are the only person who can fix it, and the fix is to upload a
+        // new document — which they cannot do if this middleware slams the door.
+        // Locking them out and then requiring them to log in to get back would
+        // be a circle with no way out of it.
+        //
+        // So they are let through, flagged as locked. The app reads
+        // `account_locked` from GET /drivers/me, shows "Document expired" over
+        // everything, and leaves the upload screen reachable. When work
+        // endpoints exist (bookings, job queue) they get a middleware that
+        // refuses anyone carrying this flag.
+        const lockedForExpiredDocuments =
+            user.status === "suspended" && user.suspension_reason === "document_expired";
+
+        if (user.status === "suspended" && !lockedForExpiredDocuments) {
             return res.status(403).json({
                 message: "This account has been suspended. Please contact the operator.",
-                error_code: "ACCOUNT_SUSPENDED"
+                error_code: "ACCOUNT_SUSPENDED",
+                suspension_reason: user.suspension_reason || null
             });
         }
+
+        user.account_locked = lockedForExpiredDocuments;
 
         // Never let the password hash travel further into the request
         delete user.password;

@@ -3,6 +3,9 @@ const storage = require("../services/storageService");
 const { detectFileType } = require("../utils/fileType");
 const {
     REQUIRED_VEHICLE_DOCUMENTS,
+    OPTIONAL_VEHICLE_DOCUMENTS,
+    ALL_VEHICLE_DOCUMENTS,
+    REQUIRED_DRIVER_DOCUMENTS,
     DOCUMENT_SOURCES,
     DOCUMENT_LABELS
 } = require("../constants/documents");
@@ -27,7 +30,11 @@ const toVehicleDocument = (d) => ({
 const addVehicle = async (req, res) => {
     try {
         const driverId = req.user.id;
-        const { vehicle_class, make, model, year, registration_number, colour, color, seats, luggage } = req.body;
+        const {
+            vehicle_class, make, model, year, registration_number,
+            colour, color, seats,
+            luggage_large, luggage_small, luggage
+        } = req.body;
 
         if (req.user.role !== "driver") {
             return res.status(403).json({
@@ -58,15 +65,22 @@ const addVehicle = async (req, res) => {
             }
         }
 
-        // UK plates have no spaces in the database, so "LX21 XYZ" and "LX21XYZ"
+        // UK plates have no spaces in the database, so "LS74 WOD" and "LS74WOD"
         // cannot both be registered as different vehicles.
         const cleanReg = String(registration_number).replace(/\s/g, "").toUpperCase();
+
+        // luggage used to be a single number; large/small replaced it. An older
+        // app version sending `luggage` still works — it counts as large bags.
+        const largeBags = luggage_large ?? luggage ?? null;
+        const smallBags = luggage_small ?? null;
 
         const newVehicle = await pool.query(
             `INSERT INTO vehicles
                 (registration_number, make, model, vehicle_class, year, color,
-                 seats, luggage, driver_id, owner_type, availability_status, verification_status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'driver', 'available', 'pending_verification')
+                 seats, luggage_large, luggage_small,
+                 driver_id, owner_type, availability_status, verification_status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                     'driver', 'available', 'pending_verification')
              RETURNING *`,
             [
                 cleanReg,
@@ -76,10 +90,27 @@ const addVehicle = async (req, res) => {
                 year || null,
                 (colour || color) ? String(colour || color).trim() : null,
                 seats || null,
-                luggage || null,
+                largeBags,
+                smallBags,
                 driverId
             ]
         );
+
+        // A driver who already has all their documents in is only waiting on a
+        // vehicle — adding one is what puts them into the operator's queue.
+        const docs = await pool.query(
+            "SELECT document_type FROM driver_documents WHERE user_id = $1 AND is_current",
+            [driverId]
+        );
+        const have = docs.rows.map((r) => r.document_type);
+
+        if (REQUIRED_DRIVER_DOCUMENTS.every((t) => have.includes(t))) {
+            await pool.query(
+                `UPDATE users SET status = 'pending_verification', updated_at = NOW()
+                 WHERE id = $1 AND status = 'account_created'`,
+                [driverId]
+            );
+        }
 
         res.status(201).json({
             message: "Vehicle added successfully. Upload its documents to complete verification.",
@@ -153,9 +184,9 @@ const uploadVehicleDocument = async (req, res) => {
             return res.status(400).json({ message: "document_type is required" });
         }
 
-        if (!REQUIRED_VEHICLE_DOCUMENTS.includes(document_type)) {
+        if (!ALL_VEHICLE_DOCUMENTS.includes(document_type)) {
             return res.status(400).json({
-                message: `document_type must be one of: ${REQUIRED_VEHICLE_DOCUMENTS.join(", ")}`
+                message: `document_type must be one of: ${ALL_VEHICLE_DOCUMENTS.join(", ")}`
             });
         }
 
@@ -214,6 +245,26 @@ const uploadVehicleDocument = async (req, res) => {
         const have = current.rows.map((r) => r.document_type);
         const missing = REQUIRED_VEHICLE_DOCUMENTS.filter((t) => !have.includes(t));
 
+        // A driver locked out by an expired document has just replaced one, so
+        // let them back in. Straight to pending_verification, not approved — the
+        // operator has to look at the new file and set its expiry date before
+        // the driver works again.
+        //
+        // Only a document_expired lock is cleared here. An operator or admin
+        // suspension is somebody's decision, and uploading a photo does not
+        // overturn it.
+        await client.query(
+            `UPDATE users
+             SET status = 'pending_verification',
+                 suspension_reason = NULL,
+                 suspended_at = NULL,
+                 updated_at = NOW()
+             WHERE id = $1
+               AND status = 'suspended'
+               AND suspension_reason = 'document_expired'`,
+            [vehicle.driver_id]
+        );
+
         await client.query("COMMIT");
         savedKey = null;
 
@@ -265,8 +316,10 @@ const getVehicleDocuments = async (req, res) => {
             vehicle_id: vehicle.id,
             documents: docs.rows.map(toVehicleDocument),
             required_documents: REQUIRED_VEHICLE_DOCUMENTS,
+            optional_documents: OPTIONAL_VEHICLE_DOCUMENTS,
             labels: DOCUMENT_LABELS,
             missing_documents: missing,
+            missing_optional_documents: OPTIONAL_VEHICLE_DOCUMENTS.filter((t) => !have.includes(t)),
             rejected_documents: docs.rows.filter((d) => d.status === "rejected").map(toVehicleDocument),
             is_complete: missing.length === 0,
             verification_status: vehicle.verification_status

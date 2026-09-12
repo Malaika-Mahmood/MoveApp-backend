@@ -1,0 +1,143 @@
+-- =============================================================================
+-- MoveApp — 005: bring `vehicles` onto the driver-owned model
+-- =============================================================================
+-- The table was still shaped for the old company-fleet model, where the
+-- operator owned the cars and handed them out (assigned_driver_id, class,
+-- status). The business rules changed: drivers own and manage their own
+-- vehicles, and operators only verify them.
+--
+-- This renames what can be renamed (keeping the data), adds what is missing,
+-- and normalises the old status values. Safe to run more than once, and safe
+-- whether the table is in the old shape, the new shape, or half-way between.
+-- =============================================================================
+
+BEGIN;
+
+-- ---------------------------------------------------------------------------
+-- 1. Rename the old columns, so existing rows keep their data
+-- ---------------------------------------------------------------------------
+
+-- class -> vehicle_class  ("class" is awkward to read in code)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'vehicles' AND column_name = 'class')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'vehicles' AND column_name = 'vehicle_class')
+    THEN
+        ALTER TABLE vehicles RENAME COLUMN class TO vehicle_class;
+    END IF;
+END $$;
+
+-- assigned_driver_id -> driver_id
+-- Old meaning: "the operator gave this car to that driver".
+-- New meaning: "this driver owns/manages this car". Same column, and for the
+-- company cars already in the table the link is the one worth keeping.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'vehicles' AND column_name = 'assigned_driver_id')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'vehicles' AND column_name = 'driver_id')
+    THEN
+        ALTER TABLE vehicles RENAME COLUMN assigned_driver_id TO driver_id;
+    END IF;
+END $$;
+
+-- status -> availability_status
+-- A single `status` had to mean both "is it verified?" and "is it free right
+-- now?", which are different questions. They are two columns now.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'vehicles' AND column_name = 'status')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'vehicles' AND column_name = 'availability_status')
+    THEN
+        ALTER TABLE vehicles RENAME COLUMN status TO availability_status;
+    END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- 2. Add anything still missing
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS driver_id           INTEGER REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS vehicle_class       VARCHAR(50);
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS year                INTEGER;
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS color               VARCHAR(30);
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS seats               SMALLINT;
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS luggage             SMALLINT;
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS owner_type          VARCHAR(20);
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS availability_status VARCHAR(30);
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS verification_status VARCHAR(30);
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS rejection_reason    VARCHAR(255);
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS pco_licence_number  VARCHAR(20);
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS created_at          TIMESTAMP NOT NULL DEFAULT NOW();
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS updated_at          TIMESTAMP NOT NULL DEFAULT NOW();
+
+-- ---------------------------------------------------------------------------
+-- 3. Fill in the existing rows
+-- ---------------------------------------------------------------------------
+
+-- A car with no driver is a company car; one linked to a driver is theirs
+UPDATE vehicles SET owner_type = 'company'
+    WHERE owner_type IS NULL AND driver_id IS NULL;
+UPDATE vehicles SET owner_type = 'driver'
+    WHERE owner_type IS NULL;
+
+-- Old values were 'available' / 'assigned'. 'assigned' becomes 'in_use';
+-- anything unrecognised falls back to 'available'.
+UPDATE vehicles SET availability_status =
+    CASE
+        WHEN availability_status IN ('available', 'in_use', 'inactive') THEN availability_status
+        WHEN availability_status = 'assigned' THEN 'in_use'
+        ELSE 'available'
+    END;
+
+-- Company cars already in the fleet were vetted before this system existed;
+-- driver-owned ones have not been looked at yet.
+UPDATE vehicles SET verification_status =
+    CASE WHEN owner_type = 'company' THEN 'approved' ELSE 'pending_verification' END
+    WHERE verification_status IS NULL;
+
+UPDATE vehicles SET vehicle_class = 'executive' WHERE vehicle_class IS NULL;
+
+ALTER TABLE vehicles ALTER COLUMN owner_type          SET DEFAULT 'driver';
+ALTER TABLE vehicles ALTER COLUMN availability_status SET DEFAULT 'available';
+ALTER TABLE vehicles ALTER COLUMN verification_status SET DEFAULT 'pending_verification';
+
+ALTER TABLE vehicles ALTER COLUMN owner_type          SET NOT NULL;
+ALTER TABLE vehicles ALTER COLUMN availability_status SET NOT NULL;
+ALTER TABLE vehicles ALTER COLUMN verification_status SET NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- 4. Constraints and indexes
+-- ---------------------------------------------------------------------------
+
+DO $$ BEGIN
+    ALTER TABLE vehicles ADD CONSTRAINT vehicles_owner_type_check
+        CHECK (owner_type IN ('driver', 'company'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    ALTER TABLE vehicles ADD CONSTRAINT vehicles_availability_check
+        CHECK (availability_status IN ('available', 'in_use', 'inactive'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    ALTER TABLE vehicles ADD CONSTRAINT vehicles_verification_check
+        CHECK (verification_status IN ('pending_verification', 'approved', 'rejected'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- Registrations are stored without spaces, so LS74 WOD and LS74WOD cannot
+-- both exist as separate vehicles
+UPDATE vehicles SET registration_number = UPPER(REPLACE(registration_number, ' ', ''));
+
+CREATE UNIQUE INDEX IF NOT EXISTS vehicles_registration_unique
+    ON vehicles (registration_number);
+CREATE INDEX IF NOT EXISTS vehicles_driver_idx ON vehicles (driver_id);
+CREATE INDEX IF NOT EXISTS vehicles_status_idx
+    ON vehicles (verification_status, availability_status);
+
+COMMIT;

@@ -1,4 +1,23 @@
-const { Pool } = require("pg");
+const { Pool, types } = require("pg");
+
+// DATE columns come back as plain "YYYY-MM-DD" strings
+// ----------------------------------------------------
+// By default pg turns a DATE into a JavaScript Date at MIDNIGHT IN THE SERVER'S
+// OWN TIME ZONE. On a machine at UTC+5 a date_of_birth of 2003-02-02 arrives as
+// 2003-02-01T19:00:00.000Z — the day before.
+//
+// That is not just untidy in the API response. Everything downstream reads it
+// in UTC, so a driver's date of birth and every licence expiry date printed on
+// the PDF came out one day early.
+//
+// A DATE has no time and no time zone; it should never have become a Date
+// object at all. Telling pg to hand back the string Postgres actually stored
+// removes the whole class of problem — the API returns "2003-02-02", the PDF
+// prints 02.02.2003, and the app gets back exactly what was typed in.
+//
+// 1082 is the OID for DATE. TIMESTAMP columns (created_at, uploaded_at, ...)
+// are deliberately left alone — those really are moments in time.
+types.setTypeParser(1082, (value) => value);
 
 // SSL handling
 // ------------

@@ -18,30 +18,20 @@ const TOKEN_EXPIRY = "7d";
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_REGEX = /^\+?[0-9\s\-()]{7,20}$/;
 
-// Operators use exactly the same sign-up flow as drivers — no credentials are
-// handed out — but only from a company email address.
+// Drivers and operators use exactly the same sign-up flow, from any email
+// address. What keeps the system safe is not who may register but what a new
+// account may do:
 //
-// Without this restriction anyone could send role: "operator", then approve
-// their own documents and become a verified driver. The whole verification
-// system rests on this one check.
+//   a new driver   cannot work until an operator approves their documents
+//   a new operator cannot review a single driver until an ADMIN approves theirs
 //
-// Set OPERATOR_EMAIL_DOMAINS in .env (comma-separated for more than one).
-const OPERATOR_EMAIL_DOMAINS = (process.env.OPERATOR_EMAIL_DOMAINS || "eurocarslondon.co.uk")
-    .split(",")
-    .map((d) => d.trim().toLowerCase().replace(/^@/, ""))
-    .filter(Boolean);
-
-if (!process.env.OPERATOR_EMAIL_DOMAINS) {
-    console.warn(
-        `[auth] OPERATOR_EMAIL_DOMAINS is not set — falling back to: ${OPERATOR_EMAIL_DOMAINS.join(", ")}`
-    );
-}
-
-const isCompanyEmail = (email) => {
-    const at = String(email).lastIndexOf("@");
-    if (at === -1) return false;
-    return OPERATOR_EMAIL_DOMAINS.includes(String(email).slice(at + 1).toLowerCase());
-};
+// The company-email restriction that used to guard operator sign-up is gone —
+// admin approval replaced it, and a person deciding is a better gate than an
+// email domain anyone can buy.
+//
+// `admin` is deliberately not accepted here. The first admin is inserted by
+// hand; after that an admin creates the others through /api/v1/admin/admins.
+const SIGNUP_ROLES = ["driver", "operator"];
 
 const issueAccessToken = (user) => {
     if (!process.env.JWT_SECRET) {
@@ -86,16 +76,9 @@ const registerStart = async (req, res) => {
         // Defaults to driver, so the app does not have to send anything
         const requestedRole = role ? String(role).trim().toLowerCase() : "driver";
 
-        if (!["driver", "operator"].includes(requestedRole)) {
+        if (!SIGNUP_ROLES.includes(requestedRole)) {
             return res.status(400).json({
                 message: "role must be either 'driver' or 'operator'"
-            });
-        }
-
-        if (requestedRole === "operator" && !isCompanyEmail(cleanEmail)) {
-            return res.status(403).json({
-                message: "Operator accounts can only be created with a company email address",
-                error_code: "OPERATOR_EMAIL_REQUIRED"
             });
         }
 
@@ -230,22 +213,20 @@ const registerVerify = async (req, res) => {
             });
         }
 
-        // An operator's email domain was already checked at registerStart, and
-        // they have no documents to submit, so they start ready to work.
-        // A driver starts at the beginning of onboarding.
-        const initialStatus = pending.role === "operator" ? "approved" : "account_created";
-
+        // Both roles start at the beginning of their own onboarding: a driver
+        // has documents and a vehicle to submit, an operator has business
+        // documents and council licences.
         await client.query("BEGIN");
 
         const newUser = await client.query(
             `INSERT INTO users
                 (first_name, middle_name, last_name, email, phone, role, status,
                  email_verified, phone_verified)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, FALSE)
+             VALUES ($1, $2, $3, $4, $5, $6, 'account_created', TRUE, FALSE)
              RETURNING id, first_name, middle_name, last_name, email, phone, role, status,
                        email_verified, phone_verified, created_at`,
             [pending.first_name, pending.middle_name, pending.last_name,
-            pending.email, pending.phone, pending.role, initialStatus]
+            pending.email, pending.phone, pending.role]
         );
 
         await client.query(

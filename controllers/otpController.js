@@ -1,192 +1,338 @@
-const pool = require("../config/db");
 const jwt = require("jsonwebtoken");
+const pool = require("../config/db");
+const notify = require("../services/notificationService");
+const {
+    OTP_TTL_MINUTES,
+    MAX_VERIFY_ATTEMPTS,
+    RESEND_COOLDOWN_SECONDS,
+    generateOtp,
+    hashOtp,
+    otpMatches,
+    otpExpiryDate,
+    secondsSince,
+    shouldExposeOtp
+} = require("../utils/otp");
 
-// ---------- PHONE OTP ----------
+// LOGIN, not sign-up.
+//
+// Sign-up lives in authController and writes to pending_registrations — no
+// users row exists yet at that point. These four endpoints are for someone who
+// already HAS an account and is coming back:
+//
+//   POST /auth/send-otp          phone   ->  POST /auth/verify-otp
+//   POST /auth/send-email-otp    email   ->  POST /auth/verify-email-otp
+//
+// Both write to otp_codes. Drivers, operators and admins all use these — the
+// role is read off the users row, never sent by the app.
 
-const sendOtp = async (req, res) => {
-    try {
-        const { phone } = req.body;
+const TOKEN_EXPIRY = "7d";
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PHONE_REGEX = /^\+?[0-9\s\-()]{7,20}$/;
 
-        if (!phone) {
-            return res.status(400).json({ message: "Phone number is required" });
-        }
-
-        const cleanPhone = String(phone).trim();
-
-        const userCheck = await pool.query("SELECT id FROM users WHERE phone = $1", [cleanPhone]);
-        if (userCheck.rows.length === 0) {
-            return res.status(404).json({ message: "No account found with this phone number" });
-        }
-
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
-        // Timezone issue fix: Postgres ka native interval use kar rahe hain
-        await pool.query(
-            `INSERT INTO otp_codes (identifier, otp, expires_at, otp_type) 
-             VALUES ($1, $2, NOW() + INTERVAL '5 minutes', 'phone')`,
-            [cleanPhone, otp]
-        );
-
-        console.log(`OTP for ${cleanPhone}: ${otp}`);
-
-        res.status(200).json({
-            message: "OTP sent successfully",
-            dev_otp: otp
-        });
-
-    } catch (error) {
-        console.error("Error in sendOtp:", error);
-        res.status(500).json({ message: "Something went wrong while sending OTP" });
+const issueAccessToken = (user) => {
+    if (!process.env.JWT_SECRET) {
+        throw new Error("JWT_SECRET is not set in the environment");
     }
+    return jwt.sign(
+        { id: user.id, role: user.role },
+        process.env.JWT_SECRET,
+        { expiresIn: TOKEN_EXPIRY }
+    );
 };
 
-const verifyOtp = async (req, res) => {
+// What the app gets back after a successful login. Deliberately the same shape
+// for every role, so the frontend has one login response to handle.
+const toAuthUser = (u) => ({
+    id: u.id,
+    title: u.title,
+    first_name: u.first_name,
+    middle_name: u.middle_name,
+    last_name: u.last_name,
+    full_name: [u.first_name, u.middle_name, u.last_name].filter(Boolean).join(" "),
+    email: u.email,
+    phone: u.phone,
+    role: u.role,
+    status: u.status,
+    email_verified: u.email_verified,
+    phone_verified: u.phone_verified,
+    created_at: u.created_at
+});
+
+// The most recent code that has not been used yet
+const findLiveCode = async (identifier, type) => {
+    const result = await pool.query(
+        `SELECT * FROM otp_codes
+         WHERE identifier = $1 AND otp_type = $2 AND is_used = FALSE
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [identifier, type]
+    );
+    return result.rows[0] || null;
+};
+
+// Shared by both send endpoints. `type` is 'phone' or 'email'.
+const sendLoginCode = async (req, res, type) => {
+    const isPhone = type === "phone";
+    const field = isPhone ? "phone" : "email";
+
     try {
-        const { phone, otp } = req.body;
+        const raw = req.body[field];
 
-        if (!phone || !otp) {
-            return res.status(400).json({ message: "Phone and OTP are required" });
+        if (!raw) {
+            return res.status(400).json({ message: `${field} is required` });
         }
 
-        const cleanPhone = String(phone).trim();
-        const cleanOtp = String(otp).trim();
+        const identifier = isPhone
+            ? String(raw).trim()
+            : String(raw).trim().toLowerCase();
 
-        const otpRecord = await pool.query(
-            `SELECT * FROM otp_codes
-             WHERE identifier = $1 AND otp = $2 AND otp_type = 'phone' AND is_used = FALSE AND expires_at > NOW()
-             ORDER BY created_at DESC LIMIT 1`,
-            [cleanPhone, cleanOtp]
-        );
+        const valid = isPhone
+            ? PHONE_REGEX.test(identifier)
+            : EMAIL_REGEX.test(identifier);
 
-        if (otpRecord.rows.length === 0) {
-            return res.status(400).json({ message: "Invalid or expired OTP" });
+        if (!valid) {
+            return res.status(400).json({
+                message: isPhone
+                    ? "Please provide a valid phone number"
+                    : "Please provide a valid email address"
+            });
         }
-
-        await pool.query("UPDATE otp_codes SET is_used = TRUE WHERE id = $1", [otpRecord.rows[0].id]);
 
         const userResult = await pool.query(
-            "SELECT * FROM users WHERE phone = $1",
-            [cleanPhone]
+            isPhone
+                ? "SELECT * FROM users WHERE phone = $1"
+                : "SELECT * FROM users WHERE LOWER(email) = $1",
+            [identifier]
         );
-
-        if (userResult.rows.length === 0) {
-            return res.status(404).json({ message: "User not found" });
-        }
-
-        const user = userResult.rows[0];
-        delete user.password_hash;
-
-        const accessToken = jwt.sign(
-            { id: user.id, role: user.role },
-            process.env.JWT_SECRET,
-            { expiresIn: "7d" }
-        );
-
-        res.status(200).json({ message: "Login successful", accessToken, user });
-
-    } catch (error) {
-        console.error("Error in verifyOtp:", error);
-        res.status(500).json({ message: "Something went wrong while verifying OTP" });
-    }
-};
-// ---------- EMAIL OTP ----------
-
-const sendEmailOtp = async (req, res) => {
-    try {
-        const { email } = req.body;
-
-        if (!email) {
-            return res.status(400).json({ message: "Email is required" });
-        }
-
-        const cleanEmail = String(email).trim().toLowerCase();
-
-        const userCheck = await pool.query(
-            "SELECT id FROM users WHERE LOWER(email) = $1",
-            [cleanEmail]
-        );
-
-        if (userCheck.rows.length === 0) {
-            return res.status(404).json({ message: "No account found with this email" });
-        }
-
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
-        // Timezone issue fix: NOW() + INTERVAL '5 minutes'
-        await pool.query(
-            `INSERT INTO otp_codes (identifier, otp, expires_at, otp_type) 
-             VALUES ($1, $2, NOW() + INTERVAL '5 minutes', 'email')`,
-            [cleanEmail, otp]
-        );
-
-        console.log(`Email OTP for ${cleanEmail}: ${otp}`);
-
-        res.status(200).json({
-            message: "OTP sent successfully",
-            dev_otp: otp
-        });
-
-    } catch (error) {
-        console.error("Error in sendEmailOtp:", error);
-        res.status(500).json({ message: "Something went wrong while sending OTP" });
-    }
-};
-
-const verifyEmailOtp = async (req, res) => {
-    try {
-        const { email, otp } = req.body;
-
-        if (!email || !otp) {
-            return res.status(400).json({ message: "Email and OTP are required" });
-        }
-
-        const cleanEmail = String(email).trim().toLowerCase();
-        const cleanOtp = String(otp).trim();
-
-        const otpRecord = await pool.query(
-            `SELECT * FROM otp_codes
-             WHERE LOWER(identifier) = $1 AND otp = $2 AND otp_type = 'email' AND is_used = FALSE AND expires_at > NOW()
-             ORDER BY created_at DESC LIMIT 1`,
-            [cleanEmail, cleanOtp]
-        );
-
-        if (otpRecord.rows.length === 0) {
-            return res.status(400).json({ message: "Invalid or expired OTP" });
-        }
-
-        // Mark OTP as used
-        await pool.query("UPDATE otp_codes SET is_used = TRUE WHERE id = $1", [otpRecord.rows[0].id]);
-
-        // Query modified to fetch all user fields safely
-        const userResult = await pool.query(
-            "SELECT * FROM users WHERE LOWER(email) = $1",
-            [cleanEmail]
-        );
-
-        if (userResult.rows.length === 0) {
-            return res.status(404).json({ message: "User not found" });
-        }
 
         const user = userResult.rows[0];
 
-        // Sensitive information exclude kar ke token generate karna
-        delete user.password_hash;
+        // Telling a stranger which phone numbers and emails have accounts is
+        // how you hand someone a list of your drivers. The response is the
+        // same either way; only a real account actually gets a code.
+        if (!user) {
+            return res.status(200).json({
+                message: `If an account exists, a verification code has been sent to your ${field}`,
+                expires_in_minutes: OTP_TTL_MINUTES
+            });
+        }
 
-        const accessToken = jwt.sign(
-            { id: user.id, role: user.role },
-            process.env.JWT_SECRET,
-            { expiresIn: "7d" }
+        // Admins sign in by phone only.
+        //
+        // An admin can open every driver's passport and every operator's
+        // licence, so theirs is the most valuable account in the system. An
+        // email inbox is the easiest thing to take over — an old password, a
+        // reused one, a leak from some unrelated site. A phone number takes far
+        // more effort to steal.
+        //
+        // This does tell the caller that a particular email belongs to an
+        // admin, which is a small leak. It is worth it: there are only three or
+        // four admins, they know to use their phone, and knowing WHICH email
+        // belongs to an admin does not help anyone get in. The alternative —
+        // silently pretending to send a code — would leave a real admin staring
+        // at a screen waiting for a message that is never coming.
+        if (user.role === "admin" && !isPhone) {
+            return res.status(403).json({
+                message: "Admins sign in with their phone number, not their email address.",
+                error_code: "ADMIN_PHONE_ONLY"
+            });
+        }
+
+        if (user.status === "suspended") {
+            return res.status(403).json({
+                message: "This account has been suspended. Please contact support.",
+                error_code: "ACCOUNT_SUSPENDED"
+            });
+        }
+
+        const live = await findLiveCode(identifier, type);
+
+        if (live) {
+            const waited = secondsSince(live.created_at);
+
+            if (waited < RESEND_COOLDOWN_SECONDS) {
+                return res.status(429).json({
+                    message: "A code was just sent. Please wait before requesting another.",
+                    retry_after_seconds: RESEND_COOLDOWN_SECONDS - waited
+                });
+            }
+
+            // Only the newest code may be used
+            await pool.query(
+                "UPDATE otp_codes SET is_used = TRUE WHERE id = $1",
+                [live.id]
+            );
+        }
+
+        const otp = generateOtp();
+
+        await pool.query(
+            `INSERT INTO otp_codes (identifier, otp_hash, otp_type, expires_at)
+             VALUES ($1, $2, $3, $4)`,
+            [identifier, hashOtp(otp), type, otpExpiryDate()]
         );
 
+        if (isPhone) {
+            await notify.sendSmsOtp(identifier, otp);
+        } else {
+            await notify.sendEmailOtp(identifier, otp);
+        }
+
         res.status(200).json({
-            message: "Login successful",
-            accessToken,
-            user
+            message: `If an account exists, a verification code has been sent to your ${field}`,
+            expires_in_minutes: OTP_TTL_MINUTES,
+            ...(shouldExposeOtp() ? { dev_otp: otp } : {})
         });
 
     } catch (error) {
-        console.error("Error in verifyEmailOtp:", error);
-        res.status(500).json({ message: "Something went wrong while verifying OTP" });
+        console.error(`Error in sendLoginCode (${type}):`, error);
+        res.status(500).json({ message: "Something went wrong while sending the code" });
     }
 };
+
+// Shared by both verify endpoints.
+const verifyLoginCode = async (req, res, type) => {
+    const isPhone = type === "phone";
+    const field = isPhone ? "phone" : "email";
+
+    try {
+        const raw = req.body[field];
+        const { otp } = req.body;
+
+        if (!raw || !otp) {
+            return res.status(400).json({ message: `${field} and otp are required` });
+        }
+
+        const identifier = isPhone
+            ? String(raw).trim()
+            : String(raw).trim().toLowerCase();
+
+        const cleanOtp = String(otp).trim();
+
+        const live = await findLiveCode(identifier, type);
+
+        if (!live || new Date(live.expires_at) <= new Date()) {
+            return res.status(400).json({
+                message: "Invalid or expired verification code"
+            });
+        }
+
+        if (live.attempt_count >= MAX_VERIFY_ATTEMPTS) {
+            return res.status(429).json({
+                message: "Too many incorrect attempts. Please request a new code."
+            });
+        }
+
+        // Rows written before the hash existed still carry a plaintext `otp`.
+        // Accepting those keeps any code sent just before this deploy working;
+        // nothing new is ever written to that column.
+        const matches = live.otp_hash
+            ? otpMatches(cleanOtp, live.otp_hash)
+            : live.otp === cleanOtp;
+
+        if (!matches) {
+            const updated = await pool.query(
+                `UPDATE otp_codes
+                 SET attempt_count = attempt_count + 1
+                 WHERE id = $1
+                 RETURNING attempt_count`,
+                [live.id]
+            );
+
+            const remaining = MAX_VERIFY_ATTEMPTS - updated.rows[0].attempt_count;
+
+            if (remaining <= 0) {
+                await pool.query(
+                    "UPDATE otp_codes SET is_used = TRUE WHERE id = $1",
+                    [live.id]
+                );
+
+                return res.status(429).json({
+                    message: "Too many incorrect attempts. Please request a new code."
+                });
+            }
+
+            return res.status(400).json({
+                message: "Invalid or expired verification code",
+                attempts_remaining: remaining
+            });
+        }
+
+        const userResult = await pool.query(
+            isPhone
+                ? "SELECT * FROM users WHERE phone = $1"
+                : "SELECT * FROM users WHERE LOWER(email) = $1",
+            [identifier]
+        );
+
+        const user = userResult.rows[0];
+
+        if (!user) {
+            return res.status(404).json({
+                message: "No account found. Please create an account first.",
+                error_code: "ACCOUNT_NOT_FOUND"
+            });
+        }
+
+        // The same rule again, on the way in. The send endpoint already refuses
+        // to issue a code to an admin's email, so nothing should reach here —
+        // but a code left over from before this rule existed, or a second way
+        // into this function added later, would otherwise walk straight past
+        // the check. The gate that matters is the one on the door being opened.
+        if (user.role === "admin" && !isPhone) {
+            return res.status(403).json({
+                message: "Admins sign in with their phone number, not their email address.",
+                error_code: "ADMIN_PHONE_ONLY"
+            });
+        }
+
+        if (user.status === "suspended") {
+            return res.status(403).json({
+                message: "This account has been suspended. Please contact support.",
+                error_code: "ACCOUNT_SUSPENDED"
+            });
+        }
+
+        // A code can only be spent once
+        await pool.query(
+            "UPDATE otp_codes SET is_used = TRUE WHERE id = $1",
+            [live.id]
+        );
+
+        // Proving control of the phone or the email verifies that one channel
+        const verified = await pool.query(
+            isPhone
+                ? `UPDATE users SET phone_verified = TRUE, updated_at = NOW()
+                   WHERE id = $1 RETURNING *`
+                : `UPDATE users SET email_verified = TRUE, updated_at = NOW()
+                   WHERE id = $1 RETURNING *`,
+            [user.id]
+        );
+
+        const fresh = verified.rows[0];
+
+        res.status(200).json({
+            message: "Logged in successfully",
+            accessToken: issueAccessToken(fresh),
+            user: toAuthUser(fresh)
+        });
+
+    } catch (error) {
+        console.error(`Error in verifyLoginCode (${type}):`, error);
+        res.status(500).json({ message: "Something went wrong while verifying the code" });
+    }
+};
+
+// POST /api/v1/auth/send-otp          { phone }
+const sendOtp = (req, res) => sendLoginCode(req, res, "phone");
+
+// POST /api/v1/auth/verify-otp        { phone, otp }
+const verifyOtp = (req, res) => verifyLoginCode(req, res, "phone");
+
+// POST /api/v1/auth/send-email-otp    { email }
+const sendEmailOtp = (req, res) => sendLoginCode(req, res, "email");
+
+// POST /api/v1/auth/verify-email-otp  { email, otp }
+const verifyEmailOtp = (req, res) => verifyLoginCode(req, res, "email");
+
 module.exports = { sendOtp, verifyOtp, sendEmailOtp, verifyEmailOtp };

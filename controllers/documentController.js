@@ -9,6 +9,7 @@ const {
     DOCUMENT_SOURCES,
     DOCUMENT_LABELS
 } = require("../constants/documents");
+const { canSeeDriverContact } = require("../utils/masking");
 
 // One shape for a document everywhere it is returned
 const toDocument = (d) => ({
@@ -25,6 +26,28 @@ const toDocument = (d) => ({
     uploaded_at: d.uploaded_at
 });
 
+// Vehicles with their current documents, in the shape the PDF builder wants
+const loadVehiclesWithDocuments = async (driverId) => {
+    const vehicles = await pool.query(
+        "SELECT * FROM vehicles WHERE driver_id = $1 ORDER BY created_at ASC",
+        [driverId]
+    );
+
+    if (vehicles.rows.length === 0) return [];
+
+    const docs = await pool.query(
+        `SELECT vd.* FROM vehicle_documents vd
+         JOIN vehicles v ON v.id = vd.vehicle_id
+         WHERE v.driver_id = $1 AND vd.is_current`,
+        [driverId]
+    );
+
+    return vehicles.rows.map((v) => ({
+        ...v,
+        documents: docs.rows.filter((d) => d.vehicle_id === v.id)
+    }));
+};
+
 // POST /api/v1/drivers/me/documents
 // multipart/form-data: file, document_type, source
 const uploadDocument = async (req, res) => {
@@ -39,13 +62,6 @@ const uploadDocument = async (req, res) => {
             return res.status(403).json({
                 message: "Only drivers upload driver documents",
                 error_code: "FORBIDDEN"
-            });
-        }
-
-        if (req.user.status === "approved") {
-            return res.status(403).json({
-                message: "Your documents are verified and can no longer be changed. Please contact the operator.",
-                error_code: "PROFILE_LOCKED"
             });
         }
 
@@ -131,16 +147,49 @@ const uploadDocument = async (req, res) => {
         const missing = REQUIRED_DRIVER_DOCUMENTS.filter((t) => !have.includes(t));
         const allUploaded = missing.length === 0;
 
-        // Move the driver into the queue once everything required is in.
-        // 'rejected' is included so a driver who re-uploads after a rejection
-        // goes back into the queue instead of being stuck.
+        // Move the driver into the queue once everything required is in and
+        // they have a vehicle. 'rejected' is included so a driver who
+        // re-uploads after a rejection goes back into the queue.
         if (allUploaded) {
+            const vehicles = await client.query(
+                "SELECT id FROM vehicles WHERE driver_id = $1",
+                [driverId]
+            );
+
+            if (vehicles.rows.length > 0) {
+                await client.query(
+                    `UPDATE users SET status = 'pending_verification', updated_at = NOW()
+                     WHERE id = $1 AND status IN ('account_created', 'rejected')`,
+                    [driverId]
+                );
+            }
+        }
+
+        // An approved driver who replaces a document goes back into the queue —
+        // the new file has not been looked at by anyone yet.
+        if (req.user.status === "approved") {
             await client.query(
-                `UPDATE users SET status = 'pending_verification', updated_at = NOW()
-                 WHERE id = $1 AND status IN ('account_created', 'rejected')`,
+                "UPDATE users SET status = 'pending_verification', updated_at = NOW() WHERE id = $1",
                 [driverId]
             );
         }
+
+        // A driver locked out by an expired document has just replaced it — and
+        // the lock deliberately STAYS ON until an operator has seen the new file
+        // and set its expiry date.
+        //
+        // This is the safe reading of the rule. These are PCO licences and
+        // insurance certificates; until somebody has confirmed the new file is
+        // genuine and in date, the driver should not be back on the road. If the
+        // upload cleared the lock by itself, re-uploading the same expired
+        // photograph would be enough to unlock the account.
+        //
+        // The upload still succeeds (201) while suspended — that much is
+        // essential, because the driver is the only person who can fix this, so
+        // they have to be able to. See middleware/authenticate.js.
+        //
+        // The lock is cleared in operatorController.recomputeDriverStatus, once
+        // every required document and the vehicle are approved.
 
         await client.query("COMMIT");
         savedKey = null;   // committed, so the file must be kept
@@ -207,62 +256,6 @@ const getMyDocuments = async (req, res) => {
     }
 };
 
-// GET /api/v1/documents/:id/file
-//
-// Replaces the old public /uploads folder. These are passports, licences and
-// National Insurance documents — anyone who guessed a filename could previously
-// download them.
-const getDocumentFile = async (req, res) => {
-    try {
-        const { id } = req.params;
-
-        if (!/^\d+$/.test(id)) {
-            return res.status(400).json({ message: "Invalid document id" });
-        }
-
-        const result = await pool.query(
-            "SELECT id, user_id, storage_key, file_format FROM driver_documents WHERE id = $1",
-            [id]
-        );
-
-        const doc = result.rows[0];
-
-        if (!doc) {
-            return res.status(404).json({ message: "Document not found" });
-        }
-
-        // The owning driver, or any operator
-        const isOwner = doc.user_id === req.user.id;
-        const isOperator = req.user.role === "operator";
-
-        if (!isOwner && !isOperator) {
-            return res.status(403).json({
-                message: "You do not have permission to view this document",
-                error_code: "FORBIDDEN"
-            });
-        }
-
-        if (!doc.storage_key || !(await storage.exists(doc.storage_key))) {
-            return res.status(404).json({ message: "File is no longer available" });
-        }
-
-        res.setHeader("Content-Type", doc.file_format || "application/octet-stream");
-        res.setHeader("Cache-Control", "private, no-store");
-
-        const stream = storage.createReadStream(doc.storage_key);
-        stream.on("error", (err) => {
-            console.error("Error streaming document", id, err);
-            if (!res.headersSent) res.status(500).json({ message: "Could not read the file" });
-        });
-        stream.pipe(res);
-
-    } catch (error) {
-        console.error("Error in getDocumentFile:", error);
-        res.status(500).json({ message: "Something went wrong while fetching the file" });
-    }
-};
-
-// Old endpoints, replaced by the token-based ones above
 // GET /api/v1/drivers/me/documents/pdf
 // All of this driver's current documents in one PDF, cover page first.
 const getMyDocumentsPdf = async (req, res) => {
@@ -281,7 +274,8 @@ const getMyDocumentsPdf = async (req, res) => {
             });
         }
 
-        const pdfBuffer = await buildDriverDocumentPdf(req.user, docs.rows);
+        const vehicles = await loadVehiclesWithDocuments(req.user.id);
+        const pdfBuffer = await buildDriverDocumentPdf(req.user, docs.rows, vehicles);
 
         const filename = `moveapp-documents-${req.user.last_name}-${req.user.id}.pdf`
             .toLowerCase().replace(/[^a-z0-9.-]/g, "-");
@@ -296,8 +290,13 @@ const getMyDocumentsPdf = async (req, res) => {
         res.status(500).json({ message: "Something went wrong while building the PDF" });
     }
 };
+
 // GET /api/v1/operator/drivers/:id/documents/pdf
-// The operator's copy — same pack, but with review status shown.
+// GET /api/v1/admin/drivers/:id/documents/pdf
+//
+// One handler, two routes. Both copies show each document's review status; the
+// difference is the contact details, and that is decided from the token rather
+// than the route — a route can be moved or reused, a role cannot be faked.
 const getDriverDocumentsPdfForOperator = async (req, res) => {
     try {
         const { id } = req.params;
@@ -328,7 +327,12 @@ const getDriverDocumentsPdfForOperator = async (req, res) => {
             });
         }
 
-        const pdfBuffer = await buildDriverDocumentPdf(driver, docs.rows, { showStatus: true });
+        const vehicles = await loadVehiclesWithDocuments(id);
+
+        const pdfBuffer = await buildDriverDocumentPdf(driver, docs.rows, vehicles, {
+            showStatus: true,
+            showContact: canSeeDriverContact(req.user.role)
+        });
 
         const filename = `moveapp-documents-${driver.last_name}-${driver.id}.pdf`
             .toLowerCase().replace(/[^a-z0-9.-]/g, "-");
@@ -343,10 +347,88 @@ const getDriverDocumentsPdfForOperator = async (req, res) => {
         res.status(500).json({ message: "Something went wrong while building the PDF" });
     }
 };
+
+// GET /api/v1/documents/:id/file
+//
+// Replaces the old public /uploads folder. These are passports, licences and
+// National Insurance documents — anyone who guessed a filename could previously
+// download them.
+const getDocumentFile = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!/^\d+$/.test(id)) {
+            return res.status(400).json({ message: "Invalid document id" });
+        }
+
+        const result = await pool.query(
+            "SELECT id, user_id, storage_key, file_format FROM driver_documents WHERE id = $1",
+            [id]
+        );
+
+        const doc = result.rows[0];
+
+        if (!doc) {
+            return res.status(404).json({ message: "Document not found" });
+        }
+
+        // The owning driver, any operator, or an admin. Admins need this for
+        // compliance requests — DVSA, an insurer or the police asking for one
+        // specific document rather than the whole pack.
+        const isOwner = doc.user_id === req.user.id;
+        const isOperator = req.user.role === "operator";
+        const isAdmin = req.user.role === "admin";
+
+        if (!isOwner && !isOperator && !isAdmin) {
+            return res.status(403).json({
+                message: "You do not have permission to view this document",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        if (!doc.storage_key || !(await storage.exists(doc.storage_key))) {
+            return res.status(404).json({ message: "File is no longer available" });
+        }
+
+        res.setHeader("Content-Type", doc.file_format || "application/octet-stream");
+        res.setHeader("Cache-Control", "private, no-store");
+
+        const stream = storage.createReadStream(doc.storage_key);
+        stream.on("error", (err) => {
+            console.error("Error streaming document", id, err);
+            if (!res.headersSent) res.status(500).json({ message: "Could not read the file" });
+        });
+        stream.pipe(res);
+
+    } catch (error) {
+        console.error("Error in getDocumentFile:", error);
+        res.status(500).json({ message: "Something went wrong while fetching the file" });
+    }
+};
+
+// Old endpoints, replaced by the token-based ones above
 const deprecated = (req, res) => {
     res.status(410).json({
         message: "This endpoint has been replaced. Use /api/v1/drivers/me/documents with a Bearer token."
     });
 };
 
-module.exports = { uploadDocument, getMyDocuments, getMyDocumentsPdf, getDriverDocumentsPdfForOperator, getDocumentFile, deprecated, toDocument };
+// GET /api/v1/admin/drivers/:id/documents/pdf
+//
+// The admin's copy of a driver pack is the same document as the operator's —
+// full pack, review status shown. Rather than copying forty lines to change
+// nothing, the same handler serves both. The routes differ in who may reach
+// them: authorize("operator") + requireApprovedOperator on one,
+// authorize("admin") on the other.
+const getDriverDocumentsPdfForAdmin = getDriverDocumentsPdfForOperator;
+
+module.exports = {
+    uploadDocument,
+    getMyDocuments,
+    getMyDocumentsPdf,
+    getDriverDocumentsPdfForOperator,
+    getDriverDocumentsPdfForAdmin,
+    getDocumentFile,
+    deprecated,
+    toDocument
+};

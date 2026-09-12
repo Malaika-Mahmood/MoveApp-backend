@@ -1,4 +1,6 @@
 const pool = require("../config/db");
+const { notifyContactRequest } = require("../services/appNotifications");
+const { expiredDocumentsFor } = require("../services/documentExpiry");
 
 // UK postcode, e.g. W1U 3BW / SW1A 1AA / M1 1AE
 const POSTCODE_REGEX = /^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$/i;
@@ -6,14 +8,25 @@ const POSTCODE_REGEX = /^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$/i;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 const VALID_TITLES = ["Mr", "Mrs", "Ms"];
-const VALID_DRIVER_TYPES = ["internal", "external"];
 
 const MIN_DRIVER_AGE = 21;   // typical UK private hire minimum
 
-// NOTE: the National Insurance number is deliberately NOT collected here.
-// It is printed on the document the driver uploads, so the operator reads it
-// off that during verification (PATCH /operator/drivers/:id/details) rather
-// than making the driver type it twice.
+// The driver now types their own National Insurance number on the Personal
+// Information screen. The operator can still correct it during verification
+// (PATCH /operator/drivers/:id/details) by reading it off the uploaded
+// document — a driver mistyping their own NI number is common, and the
+// document is the authority.
+//
+// This regex is the same one the operator endpoint uses. The prefixes below
+// are never issued by HMRC, and QQ123456C in particular is HMRC's own
+// placeholder — it can never be a real number, so it must be rejected.
+const NI_REGEX = /^(?!BG|GB|KN|NK|NT|TN|ZZ)[A-CEGHJ-PR-TW-Z][A-CEGHJ-NPR-TW-Z]\d{6}[A-D]$/i;
+
+// "AB 12 34 56 C" and "ab123456c" are the same number written differently.
+const normaliseNi = (value) => String(value).replace(/\s+/g, "").toUpperCase();
+
+// NOTE: internal / external driver type has been removed — every driver is
+// treated the same under the universal app model.
 
 // Shape the frontend receives everywhere a driver profile is returned.
 // Keeping it in one function means every endpoint sends the same fields.
@@ -34,20 +47,28 @@ const toProfile = (u) => ({
     address: u.address,
     postcode: u.postcode,
 
-    // Filled in by the operator from the documents — read-only to the driver
+    // Typed by the driver, correctable by the operator
     ni_number: u.ni_number,
+
+    // Filled in by the operator from the documents — read-only to the driver
     driving_licence_number: u.driving_licence_number,
     pco_licence_number: u.pco_licence_number,
 
-    driver_type: u.driver_type,
-    driver_type_confirmed: u.driver_type_confirmed,
     created_at: u.created_at,
+
+    // The app locks itself on this. A locked driver can still open the document
+    // screens — that is the whole point, they have to be able to fix it — but
+    // everything else is covered over.
+    account_locked: Boolean(u.account_locked),
+    suspension_reason: u.suspension_reason || null,
+    suspended_at: u.suspended_at || null,
 
     // Onboarding progress, so the app knows which screen to show next
     // without having to work it out from null checks.
     onboarding: {
-        personal_info_complete: Boolean(u.title && u.date_of_birth && u.postcode),
-        driver_type_selected: Boolean(u.driver_type)
+        personal_info_complete: Boolean(
+            u.title && u.date_of_birth && u.postcode && u.ni_number
+        )
     }
 });
 
@@ -55,7 +76,42 @@ const toProfile = (u) => ({
 const getMe = async (req, res) => {
     try {
         // authenticate already loaded the row, so no second query is needed
-        res.status(200).json({ user: toProfile(req.user) });
+        const user = toProfile(req.user);
+
+        // The lock screen. Only looked up when the driver is actually locked —
+        // no point running this query on every profile load for the 99% who are
+        // not. It names the documents so the app can say "your MOT expired on
+        // 14.09.2026" instead of "a document expired", which is the difference
+        // between a driver who knows what to do and one who phones the office.
+        if (req.user.account_locked) {
+            user.expired_documents = await expiredDocumentsFor(req.user.id);
+
+            // Once the driver uploads a replacement, the expired file stops
+            // being the current one, so expired_documents empties out — but the
+            // lock stays on until an operator approves the new file. Without
+            // these two fields the app would show a lock screen with nothing on
+            // it and no explanation of what the driver is waiting for.
+            const awaiting = await pool.query(
+                `SELECT id, document_type, uploaded_at
+                 FROM driver_documents
+                 WHERE user_id = $1 AND is_current AND status = 'pending_review'
+                 ORDER BY uploaded_at DESC`,
+                [req.user.id]
+            );
+
+            user.pending_review_documents = awaiting.rows.map((d) => ({
+                document_id: d.id,
+                document_type: d.document_type,
+                uploaded_at: d.uploaded_at
+            }));
+
+            // true  → "Your new document is with an operator. We will let you know."
+            // false → "These documents have expired. Upload a new one."
+            user.replacement_pending =
+                user.expired_documents.length === 0 && awaiting.rows.length > 0;
+        }
+
+        res.status(200).json({ user });
     } catch (error) {
         console.error("Error in getMe:", error);
         res.status(500).json({ message: "Something went wrong while fetching your profile" });
@@ -63,13 +119,19 @@ const getMe = async (req, res) => {
 };
 
 // PATCH /api/v1/drivers/me/personal
-// Title, date of birth, address, postcode.
+// Title, middle name, date of birth, NI number, address, postcode.
 //
 // Editable at any time, including after approval — people move house, and
 // making them phone the operator for that would be silly.
+//
+// middle_name is here because Create Account does not force one, and a driver
+// who skipped it there had no way to add it afterwards — while their passport
+// and licence both carry it, which is exactly what the operator is matching
+// against. First and last name are deliberately NOT editable: those are the
+// identity the whole account was opened under.
 const updatePersonalInfo = async (req, res) => {
     try {
-        const { title, date_of_birth, address, postcode } = req.body;
+        const { title, middle_name, date_of_birth, ni_number, address, postcode } = req.body;
 
         if (req.user.role !== "driver") {
             return res.status(403).json({
@@ -78,13 +140,50 @@ const updatePersonalInfo = async (req, res) => {
             });
         }
 
-        if (!title || !date_of_birth || !postcode) {
+        if (!title || !date_of_birth || !postcode || !ni_number) {
             return res.status(400).json({
-                message: "title, date_of_birth and postcode are required"
+                message: "title, date_of_birth, ni_number and postcode are required"
             });
         }
 
         const cleanTitle = String(title).trim();
+        const cleanNi = normaliseNi(ni_number);
+
+        // Three different things the app might send, and they mean three
+        // different things:
+        //
+        //   key absent          leave whatever is stored alone
+        //   ""  or "   "        the driver cleared the field — store NULL
+        //   "Ahmad"             store it
+        //
+        // Without this an app that always sends every field would wipe a middle
+        // name every time the driver saved their address.
+        const middleNameProvided = Object.prototype.hasOwnProperty.call(req.body, "middle_name");
+        let cleanMiddleName;
+
+        if (middleNameProvided) {
+            const trimmed = middle_name === null ? "" : String(middle_name).trim();
+
+            if (trimmed === "") {
+                cleanMiddleName = null;
+            } else {
+                if (trimmed.length < 2 || trimmed.length > 50) {
+                    return res.status(400).json({
+                        message: "middle_name must be between 2 and 50 characters"
+                    });
+                }
+
+                // Letters, spaces, hyphens and apostrophes — enough for
+                // "Anne-Marie" and "O'Brien", nothing else.
+                if (!/^[\p{L}][\p{L}\s'-]*$/u.test(trimmed)) {
+                    return res.status(400).json({
+                        message: "middle_name may only contain letters, spaces, hyphens and apostrophes"
+                    });
+                }
+
+                cleanMiddleName = trimmed;
+            }
+        }
         const cleanPostcode = String(postcode).trim().toUpperCase();
         const cleanAddress = address ? String(address).trim() : null;
 
@@ -124,13 +223,41 @@ const updatePersonalInfo = async (req, res) => {
             });
         }
 
+        if (!NI_REGEX.test(cleanNi)) {
+            return res.status(400).json({
+                message: "ni_number must be a valid UK National Insurance number (e.g. AB123456C)",
+                error_code: "INVALID_NI_NUMBER"
+            });
+        }
+
+        // One National Insurance number belongs to one person. Two accounts
+        // sharing one is either a typo or someone using another driver's
+        // identity, and neither should be allowed through quietly.
+        const clash = await pool.query(
+            "SELECT id FROM users WHERE UPPER(ni_number) = $1 AND id <> $2",
+            [cleanNi, req.user.id]
+        );
+
+        if (clash.rows.length > 0) {
+            return res.status(409).json({
+                message: "This National Insurance number is already registered to another account",
+                error_code: "NI_NUMBER_IN_USE"
+            });
+        }
+
+        // middle_name is only touched when the key was actually sent, which is
+        // why it is not a plain COALESCE like address: COALESCE could never
+        // clear it, and here clearing is a real thing a driver may want.
         const updated = await pool.query(
             `UPDATE users
-             SET title = $1, date_of_birth = $2,
-                 address = COALESCE($3, address), postcode = $4, updated_at = NOW()
-             WHERE id = $5
+             SET title = $1, date_of_birth = $2, ni_number = $3,
+                 address = COALESCE($4, address), postcode = $5,
+                 middle_name = CASE WHEN $6 THEN $7 ELSE middle_name END,
+                 updated_at = NOW()
+             WHERE id = $8
              RETURNING *`,
-            [cleanTitle, date_of_birth, cleanAddress, cleanPostcode, req.user.id]
+            [cleanTitle, date_of_birth, cleanNi, cleanAddress, cleanPostcode,
+                middleNameProvided, cleanMiddleName ?? null, req.user.id]
         );
 
         res.status(200).json({
@@ -139,67 +266,120 @@ const updatePersonalInfo = async (req, res) => {
         });
 
     } catch (error) {
+        if (error.code === "23505") {
+            return res.status(409).json({
+                message: "This National Insurance number is already registered to another account",
+                error_code: "NI_NUMBER_IN_USE"
+            });
+        }
+
         console.error("Error in updatePersonalInfo:", error);
         res.status(500).json({ message: "Something went wrong while saving your information" });
     }
 };
 
-// PATCH /api/v1/drivers/me/type
-// internal (company) or external.
+// POST /api/v1/drivers/me/contact-request
+// Body: { message } — optional, up to 300 characters
 //
-// This is the driver's own claim. It does not change which documents are
-// required — every driver uploads their own — and the operator confirms it.
-const updateDriverType = async (req, res) => {
-    try {
-        const { driver_type } = req.body;
+// The driver cannot see the operator's phone number or email, so this is how
+// they ask to be contacted: the operator gets a notification and reaches out.
+//
+// WHICH operator is told: the one who last verified any of this driver's
+// documents. That is a stand-in. There is no column yet saying which operator a
+// driver belongs to — the CEO has not decided how that link is formed — and
+// "whoever reviewed you" is the closest true answer today's data can give. When
+// the link exists, only the query below changes.
+//
+// If nobody has reviewed them yet, every admin is told instead, so a request is
+// never simply lost.
+const CONTACT_REQUEST_COOLDOWN_MINUTES = 60;
 
+const requestContact = async (req, res) => {
+    try {
         if (req.user.role !== "driver") {
             return res.status(403).json({
-                message: "Only drivers have a driver type",
+                message: "Only drivers can send a contact request",
                 error_code: "FORBIDDEN"
             });
         }
 
-        if (!driver_type) {
-            return res.status(400).json({ message: "driver_type is required" });
+        const { message } = req.body || {};
+        let cleanMessage = null;
+
+        if (message !== undefined && message !== null && String(message).trim() !== "") {
+            cleanMessage = String(message).trim();
+
+            if (cleanMessage.length > 300) {
+                return res.status(400).json({
+                    message: "message must be 300 characters or fewer"
+                });
+            }
         }
 
-        const cleanType = String(driver_type).trim().toLowerCase();
+        // One request an hour. Without it a driver waiting for an answer taps
+        // the button again and again, the operator's bell fills with the same
+        // request, and they stop reading it.
+        const recent = await pool.query(
+            `SELECT created_at FROM notifications
+             WHERE actor_id = $1
+               AND type = 'contact_request'
+               AND created_at > NOW() - make_interval(mins => $2)
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [req.user.id, CONTACT_REQUEST_COOLDOWN_MINUTES]
+        );
 
-        if (!VALID_DRIVER_TYPES.includes(cleanType)) {
-            return res.status(400).json({
-                message: `driver_type must be one of: ${VALID_DRIVER_TYPES.join(", ")}`
+        if (recent.rows.length > 0) {
+            const waited = Math.floor(
+                (Date.now() - new Date(recent.rows[0].created_at).getTime()) / 1000
+            );
+
+            return res.status(429).json({
+                message: "You have already asked to be contacted. Please wait for a reply.",
+                error_code: "CONTACT_REQUEST_TOO_SOON",
+                retry_after_seconds: Math.max(0, CONTACT_REQUEST_COOLDOWN_MINUTES * 60 - waited)
             });
         }
 
-        // Changing the claim clears the operator's confirmation, so a confirmed
-        // "external" cannot quietly become "internal". An already-approved
-        // driver goes back into the queue, because approval depended on the
-        // operator having confirmed the old value.
-        const updated = await pool.query(
-            `UPDATE users
-             SET driver_type = $1,
-                 driver_type_confirmed = FALSE,
-                 status = CASE WHEN status = 'approved' THEN 'pending_verification' ELSE status END,
-                 updated_at = NOW()
-             WHERE id = $2
-             RETURNING *`,
-            [cleanType, req.user.id]
+        const reviewers = await pool.query(
+            `SELECT verified_by, MAX(verified_at) AS last_seen
+             FROM driver_documents
+             WHERE user_id = $1 AND verified_by IS NOT NULL
+             GROUP BY verified_by
+             ORDER BY last_seen DESC
+             LIMIT 1`,
+            [req.user.id]
         );
 
-        const user = updated.rows[0];
+        let recipients = reviewers.rows.map((r) => r.verified_by);
 
-        res.status(200).json({
-            message: req.user.status === "approved" && user.status === "pending_verification"
-                ? "Driver type saved. An operator needs to confirm the change before you are approved again."
-                : "Driver type saved",
-            user: toProfile(user)
+        if (recipients.length === 0) {
+            const admins = await pool.query(
+                "SELECT id FROM users WHERE role = 'admin' AND status <> 'suspended'"
+            );
+            recipients = admins.rows.map((r) => r.id);
+        }
+
+        if (recipients.length === 0) {
+            return res.status(503).json({
+                message: "There is nobody available to contact right now. Please try again later.",
+                error_code: "NO_RECIPIENT"
+            });
+        }
+
+        for (const recipientId of recipients) {
+            await notifyContactRequest(recipientId, req.user, cleanMessage);
+        }
+
+        res.status(201).json({
+            message: "Your request has been sent. Someone will contact you shortly.",
+            sent_to: recipients.length
         });
 
     } catch (error) {
-        console.error("Error in updateDriverType:", error);
-        res.status(500).json({ message: "Something went wrong while saving your driver type" });
+        console.error("Error in requestContact:", error);
+        res.status(500).json({ message: "Something went wrong while sending your request" });
     }
 };
 
-module.exports = { getMe, updatePersonalInfo, updateDriverType, toProfile };
+module.exports = { getMe, updatePersonalInfo, requestContact, toProfile };
