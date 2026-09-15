@@ -118,10 +118,51 @@ const notifyExpiryLockCleared = (driverId) =>
         })
     );
 
+// Somebody typed this driver's share code and wants to see the documents.
+//
+// Neither name appears. The driver knows who they gave their code to; naming
+// the operator would tell them who ELSE holds it, which is a different and
+// worse thing to reveal.
+//
+// `data.request_id` is what the Allow and Deny buttons send back — so this one
+// notification is not simply text to display, the app has to render it as a
+// decision with two buttons.
+const notifyAccessRequest = (driverId, requestId) =>
+    safely("access_request", async () =>
+        create({
+            userId: driverId,
+            type: NOTIFICATION_TYPES.ACCESS_REQUEST,
+            title: "An operator wants to view your documents",
+            body: "They used your share code. Allow only if you gave it to them.",
+            data: { request_id: requestId, requires_decision: true }
+        })
+    );
+
+// The driver answered. The operator has to be told, or they sit watching a
+// screen that never changes.
+const notifyAccessDecision = (operatorId, driverName, approved, requestId) =>
+    safely("access_decision", async () =>
+        create({
+            userId: operatorId,
+            type: approved
+                ? NOTIFICATION_TYPES.ACCESS_GRANTED
+                : NOTIFICATION_TYPES.ACCESS_DENIED,
+            title: approved
+                ? `${driverName} allowed access to their documents`
+                : `${driverName} declined your request`,
+            body: approved
+                ? "You can view them for the next 30 minutes."
+                : null,
+            data: { request_id: requestId }
+        })
+    );
+
 module.exports = {
     create,
     sentWithinLastDay,
     notifyDocumentsViewed,
     notifyContactRequest,
-    notifyExpiryLockCleared
+    notifyExpiryLockCleared,
+    notifyAccessRequest,
+    notifyAccessDecision
 };

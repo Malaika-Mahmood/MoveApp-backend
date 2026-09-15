@@ -1,5 +1,9 @@
 const pool = require("../config/db");
-const { notifyContactRequest } = require("../services/appNotifications");
+const {
+    notifyContactRequest,
+    notifyAccessDecision
+} = require("../services/appNotifications");
+const shareAccess = require("../services/shareAccess");
 const { expiredDocumentsFor } = require("../services/documentExpiry");
 
 // UK postcode, e.g. W1U 3BW / SW1A 1AA / M1 1AE
@@ -382,4 +386,171 @@ const requestContact = async (req, res) => {
     }
 };
 
-module.exports = { getMe, updatePersonalInfo, requestContact, toProfile };
+// -----------------------------------------------------------------------------
+// Share code
+// -----------------------------------------------------------------------------
+// The driver's own ID and PIN, and the requests that arrive because of them.
+//
+// The ID never changes — it is how the driver is known. The PIN is theirs to
+// change whenever they like, which is the only remedy for having given it to
+// somebody they later think better of.
+
+// GET /api/v1/drivers/me/share-code
+const getShareCode = async (req, res) => {
+    try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers have a share code",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        const code = await shareAccess.getOrCreateShareCode(req.user.id);
+
+        res.status(200).json({
+            share_id: code.share_id,
+            pin: code.share_pin,
+            pin_updated_at: code.share_pin_updated_at,
+            grant_minutes: shareAccess.GRANT_MINUTES
+        });
+
+    } catch (error) {
+        console.error("Error in getShareCode:", error);
+        res.status(500).json({ message: "Something went wrong while fetching your share code" });
+    }
+};
+
+// POST /api/v1/drivers/me/share-code/pin
+//
+// Body is optional. `{ "pin": "451203" }` sets a chosen one; an empty body
+// gets a random one, which is what a "Generate new PIN" button sends.
+const changeSharePin = async (req, res) => {
+    try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers have a share code",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        const { pin } = req.body || {};
+
+        if (pin !== undefined && pin !== null && !shareAccess.normalisePin(pin)) {
+            return res.status(400).json({
+                message: "pin must be exactly 6 digits",
+                error_code: "INVALID_PIN"
+            });
+        }
+
+        // Make sure a code exists at all before changing half of it.
+        await shareAccess.getOrCreateShareCode(req.user.id);
+
+        const updated = await shareAccess.changePin(req.user.id, pin ?? null);
+
+        res.status(200).json({
+            message: "PIN updated",
+            share_id: updated.share_id,
+            pin: updated.share_pin,
+            pin_updated_at: updated.share_pin_updated_at
+        });
+
+    } catch (error) {
+        console.error("Error in changeSharePin:", error);
+        res.status(500).json({ message: "Something went wrong while changing your PIN" });
+    }
+};
+
+// GET /api/v1/drivers/me/access-requests
+const listAccessRequests = async (req, res) => {
+    try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers have access requests",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        const requests = await shareAccess.requestsForDriver(req.user.id);
+
+        res.status(200).json({
+            requests,
+            pending_count: requests.filter((r) => r.status === "pending").length
+        });
+
+    } catch (error) {
+        console.error("Error in listAccessRequests:", error);
+        res.status(500).json({ message: "Something went wrong while fetching your access requests" });
+    }
+};
+
+// PATCH /api/v1/drivers/me/access-requests/:id
+// { "decision": "approved" }  or  { "decision": "denied" }
+const decideAccessRequest = async (req, res) => {
+    try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers can answer access requests",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        const { id } = req.params;
+        if (!/^\d+$/.test(id)) {
+            return res.status(400).json({ message: "Invalid request id" });
+        }
+
+        const { decision } = req.body || {};
+        if (decision !== "approved" && decision !== "denied") {
+            return res.status(400).json({
+                message: "decision must be 'approved' or 'denied'",
+                error_code: "INVALID_DECISION"
+            });
+        }
+
+        const updated = await shareAccess.decideRequest(req.user.id, Number(id), decision);
+
+        // 404, not 403 or 409. The request is either not theirs, does not
+        // exist, or has already been answered — and saying which of those it is
+        // would leak other people's requests.
+        if (!updated) {
+            return res.status(404).json({
+                message: "No pending request with that id",
+                error_code: "NOT_FOUND"
+            });
+        }
+
+        await notifyAccessDecision(
+            updated.operator_id,
+            [req.user.first_name, req.user.last_name].filter(Boolean).join(" "),
+            decision === "approved",
+            updated.id
+        );
+
+        res.status(200).json({
+            message: decision === "approved"
+                ? `Access allowed for ${shareAccess.GRANT_MINUTES} minutes`
+                : "Access denied",
+            request: {
+                id: updated.id,
+                status: updated.status,
+                decided_at: updated.decided_at,
+                expires_at: updated.expires_at
+            }
+        });
+
+    } catch (error) {
+        console.error("Error in decideAccessRequest:", error);
+        res.status(500).json({ message: "Something went wrong while answering the request" });
+    }
+};
+
+module.exports = {
+    getMe,
+    updatePersonalInfo,
+    requestContact,
+    getShareCode,
+    changeSharePin,
+    listAccessRequests,
+    decideAccessRequest,
+    toProfile
+};

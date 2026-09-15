@@ -21,7 +21,16 @@ const NOTIFICATION_TYPES = {
     DOCUMENT_REJECTED: "document_rejected",
     ACCOUNT_APPROVED: "account_approved",
     ACCOUNT_REJECTED: "account_rejected",
-    ACCOUNT_SUSPENDED: "account_suspended"
+    ACCOUNT_SUSPENDED: "account_suspended",
+
+    // Share code. An operator typed a driver's ID and PIN and wants to see the
+    // documents; the driver answers yes or no.
+    //
+    // ACCESS_REQUEST goes to the driver and is the only notification in the
+    // product that the app must not simply display — it needs two buttons.
+    ACCESS_REQUEST: "access_request",
+    ACCESS_GRANTED: "access_granted",
+    ACCESS_DENIED: "access_denied"
 };
 
 const ALL_NOTIFICATION_TYPES = Object.values(NOTIFICATION_TYPES);

@@ -4,6 +4,8 @@ const router = express.Router();
 const {
     getPendingDrivers,
     getDriverDetail,
+    lookupDriverByShareCode,
+    getSharedDriverDocuments,
     verifyDriverDocument,
     verifyVehicleDocument,
     updateDriverDetails,
@@ -26,6 +28,14 @@ const requireApprovedOperator = require("../middleware/requireApprovedOperator")
 // can register with any email now, but until an admin approves their own
 // documents they cannot touch a single driver.
 router.use(authenticate, authorize("operator"), requireApprovedOperator);
+
+// Share code
+//
+// Declared above "/drivers/:id" because these are a different kind of access
+// altogether: the queue is drivers this operator is responsible for, this is a
+// driver who walked up and showed a code.
+router.post("/driver-lookup", lookupDriverByShareCode);
+router.get("/shared-drivers/:id/documents", getSharedDriverDocuments);
 
 // Queue
 router.get("/drivers/pending", getPendingDrivers);

@@ -12,8 +12,10 @@ const {
 const { maskDriverContact } = require("../utils/masking");
 const {
     notifyDocumentsViewed,
-    notifyExpiryLockCleared
+    notifyExpiryLockCleared,
+    notifyAccessRequest
 } = require("../services/appNotifications");
+const shareAccess = require("../services/shareAccess");
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -652,9 +654,196 @@ const setDriverSuspension = async (req, res) => {
 
 // REMOVED: confirmDriverType — internal vs external no longer exists.
 
+// -----------------------------------------------------------------------------
+// Share code lookup
+// -----------------------------------------------------------------------------
+// A driver has handed over their ID and PIN. Two different questions follow,
+// and they are deliberately answered in two different places:
+//
+//   "Is this person verified?"   answered immediately, no permission needed. It
+//                                is the whole reason the driver gave out the
+//                                code in the first place.
+//
+//   "Show me the documents."     a request the driver has to allow, and then
+//                                only for thirty minutes.
+//
+// A driver proving they are licensed should not have to hand over their
+// passport to do it.
+
+// POST /api/v1/operator/driver-lookup
+// { "share_id": "MV-1A2B-3C4", "pin": "451203" }
+const lookupDriverByShareCode = async (req, res) => {
+    try {
+        const { share_id, pin } = req.body || {};
+
+        if (!share_id || !pin) {
+            return res.status(400).json({
+                message: "share_id and pin are required",
+                error_code: "MISSING_FIELDS"
+            });
+        }
+
+        // Still locked out from earlier wrong guesses?
+        const lockedFor = await shareAccess.failureLockoutSeconds(req.user.id);
+        if (lockedFor > 0) {
+            return res.status(429).json({
+                message: "Too many incorrect codes. Please try again later.",
+                error_code: "LOOKUP_LOCKED",
+                retry_after_seconds: lockedFor
+            });
+        }
+
+        const driver = await shareAccess.findByShareCode(share_id, pin);
+
+        if (!driver) {
+            await shareAccess.recordAttempt(
+                req.user.id, shareAccess.normaliseShareId(share_id), false
+            );
+
+            // One message for a wrong ID and a wrong PIN alike. Two different
+            // messages would let somebody sweep the ID space to find out which
+            // codes are real.
+            return res.status(404).json({
+                message: "No driver found with that ID and PIN",
+                error_code: "SHARE_CODE_NOT_FOUND"
+            });
+        }
+
+        await shareAccess.recordAttempt(req.user.id, driver.share_id, true);
+
+        const outcome = await shareAccess.createRequest(req.user.id, driver);
+
+        if (outcome.isNew) {
+            notifyAccessRequest(driver.id, outcome.request.id);
+        }
+
+        // What comes back with no permission at all: a name, and whether this
+        // driver is verified. Nothing else — no date of birth, no National
+        // Insurance number, no contact details, no documents.
+        res.status(200).json({
+            driver: {
+                id: driver.id,
+                full_name: [driver.first_name, driver.middle_name, driver.last_name]
+                    .filter(Boolean).join(" "),
+                share_id: driver.share_id,
+                is_verified: driver.status === "approved",
+                status: driver.status
+            },
+
+            access: {
+                request_id: outcome.request.id,
+                status: outcome.status,
+                expires_at: outcome.request.expires_at || null,
+                message: outcome.status === "approved"
+                    ? "You already have permission to view this driver's documents."
+                    : "The driver has been asked. You will be notified when they answer."
+            }
+        });
+
+    } catch (error) {
+        console.error("Error in lookupDriverByShareCode:", error);
+        res.status(500).json({ message: "Something went wrong while looking up the driver" });
+    }
+};
+
+// GET /api/v1/operator/shared-drivers/:id/documents
+//
+// The same documents an operator sees for their own drivers, reached through a
+// grant instead of through the verification queue.
+const getSharedDriverDocuments = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!/^\d+$/.test(id)) {
+            return res.status(400).json({ message: "Invalid driver id" });
+        }
+
+        const grant = await shareAccess.activeGrant(req.user.id, Number(id));
+
+        if (!grant) {
+            // Covers all three of: never asked, denied, and expired. The
+            // operator does not need those told apart, and what the driver
+            // decided is not their business beyond yes or no.
+            return res.status(403).json({
+                message: "You do not have permission to view this driver's documents",
+                error_code: "ACCESS_NOT_GRANTED"
+            });
+        }
+
+        const driverResult = await pool.query(
+            "SELECT * FROM users WHERE id = $1 AND role = 'driver'",
+            [id]
+        );
+        const driver = driverResult.rows[0];
+        if (!driver) return res.status(404).json({ message: "Driver not found" });
+
+        const docs = await pool.query(
+            `SELECT * FROM driver_documents
+             WHERE user_id = $1 AND is_current
+             ORDER BY document_type`,
+            [id]
+        );
+
+        const vehicles = await pool.query(
+            "SELECT * FROM vehicles WHERE driver_id = $1 ORDER BY created_at ASC",
+            [id]
+        );
+
+        const vehicleDocs = await pool.query(
+            `SELECT vd.* FROM vehicle_documents vd
+             JOIN vehicles v ON v.id = vd.vehicle_id
+             WHERE v.driver_id = $1 AND vd.is_current`,
+            [id]
+        );
+
+        // No notifyDocumentsViewed here. The driver was asked a moment ago and
+        // tapped Allow; telling them again that their documents were opened
+        // would be noise, not news.
+
+        res.status(200).json({
+            driver: maskDriverContact({
+                id: driver.id,
+                title: driver.title,
+                first_name: driver.first_name,
+                middle_name: driver.middle_name,
+                last_name: driver.last_name,
+                full_name: [driver.first_name, driver.middle_name, driver.last_name]
+                    .filter(Boolean).join(" "),
+                date_of_birth: driver.date_of_birth,
+                email: driver.email,
+                phone: driver.phone,
+                ni_number: driver.ni_number,
+                address: driver.address,
+                postcode: driver.postcode,
+                driving_licence_number: driver.driving_licence_number,
+                pco_licence_number: driver.pco_licence_number,
+                status: driver.status,
+                created_at: driver.created_at
+            }, req.user.role),
+
+            documents: docs.rows.map(toDocument),
+
+            vehicles: vehicles.rows.map((v) => {
+                const its = vehicleDocs.rows.filter((d) => d.vehicle_id === v.id);
+                return { ...v, documents: its.map(toVehicleDocument) };
+            }),
+
+            access: {
+                request_id: grant.id,
+                expires_at: grant.expires_at
+            }
+        });
+
+    } catch (error) {
+        console.error("Error in getSharedDriverDocuments:", error);
+        res.status(500).json({ message: "Something went wrong while fetching the documents" });
+    }
+};
+
 module.exports = {
     getPendingDrivers,
     getDriverDetail,
+    lookupDriverByShareCode,
+    getSharedDriverDocuments,
     verifyDriverDocument,
     verifyVehicleDocument,
     updateDriverDetails,

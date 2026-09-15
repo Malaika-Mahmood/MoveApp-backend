@@ -4,7 +4,11 @@ const router = express.Router();
 const {
     getMe,
     updatePersonalInfo,
-    requestContact
+    requestContact,
+    getShareCode,
+    changeSharePin,
+    listAccessRequests,
+    decideAccessRequest
 } = require("../controllers/driverController");
 const {
     uploadDocument,
@@ -31,6 +35,17 @@ router.get("/me/documents/pdf", authenticate, getMyDocumentsPdf);
 // The driver cannot see the operator's number, so this asks the operator to
 // get in touch instead.
 router.post("/me/contact-request", authenticate, requestContact);
+
+// Share code
+//
+// The driver's own ID and PIN, and the requests that arrive because of them.
+// "/me/share-code/pin" is declared before nothing in particular, but the fixed
+// path stays above the parameterised one below out of habit.
+router.get("/me/share-code", authenticate, getShareCode);
+router.post("/me/share-code/pin", authenticate, changeSharePin);
+
+router.get("/me/access-requests", authenticate, listAccessRequests);
+router.patch("/me/access-requests/:id", authenticate, decideAccessRequest);
 
 // REMOVED: PATCH /me/type — internal vs external no longer exists.
 

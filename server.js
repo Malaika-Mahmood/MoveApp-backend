@@ -12,6 +12,8 @@ const documentRoutes = require("./routes/documentRoutes");
 const vehicleRoutes = require("./routes/vehicleRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
 const cronRoutes = require("./routes/cronRoutes");
+const bookingRoutes = require("./routes/bookingRoutes");
+const vehicleClassRoutes = require("./routes/vehicleClassRoutes");
 
 const app = express();
 
@@ -32,6 +34,16 @@ app.use("/api/v1/vehicles", vehicleRoutes);
 //   /operators  — the operator's own onboarding, reviewed by an admin
 //   /operator   — the work an approved operator does on drivers
 app.use("/api/v1/operators", operatorProfileRoutes);
+
+// Bookings, mounted BEFORE "/api/v1/operator".
+//
+// Express tries routers in the order they are added. Mounted the other way
+// round, every request to /operator/bookings would run operatorRoutes' three
+// gates first, find no matching path, and only then fall through to here —
+// authenticating twice and making the 404 for a typo come from the wrong
+// router. Specific before general.
+app.use("/api/v1/operator/bookings", bookingRoutes);
+
 app.use("/api/v1/operator", operatorRoutes);
 
 // Admins
@@ -42,6 +54,10 @@ app.use("/api/v1/documents", documentRoutes);
 
 // The bell icon — every role uses the same three endpoints
 app.use("/api/v1/notifications", notificationRoutes);
+
+// Vehicle classes — a lookup table every role reads
+app.use("/api/v1/vehicle-classes", vehicleClassRoutes);
+
 
 // Scheduled jobs.
 //
