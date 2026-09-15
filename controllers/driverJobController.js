@@ -81,6 +81,10 @@ const setOnline = async (req, res) => {
 // -----------------------------------------------------------------------------
 const listMyOffers = async (req, res) => {
     try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({ message: "Drivers only", error_code: "FORBIDDEN" });
+        }
+
         await offers.expireDueOffers();
 
         const result = await pool.query(
@@ -127,6 +131,13 @@ const respondToOffer = async (req, res) => {
         const { id } = req.params;
         if (!/^\d+$/.test(id)) {
             return res.status(400).json({ message: "Invalid offer id" });
+        }
+
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers can answer job offers",
+                error_code: "FORBIDDEN"
+            });
         }
 
         const { decision, vehicle_id, reason } = req.body || {};
@@ -275,6 +286,17 @@ const claimJob = async (req, res) => {
             return res.status(400).json({ message: "Invalid job id" });
         }
 
+        // Checked here, before the service. Without it an operator calling this
+        // endpoint fell through to "That driver does not exist" — which is true
+        // in the narrow sense and useless to read, because the person asking is
+        // logged in and knows they exist.
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers can take jobs",
+                error_code: "FORBIDDEN"
+            });
+        }
+
         if (req.user.account_locked) {
             return res.status(403).json({
                 message: "Upload your replacement document before taking jobs",
@@ -319,6 +341,10 @@ const claimJob = async (req, res) => {
 // -----------------------------------------------------------------------------
 const listMyJobs = async (req, res) => {
     try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({ message: "Drivers only", error_code: "FORBIDDEN" });
+        }
+
         const scope = ["upcoming", "today", "past", "active"].includes(req.query.scope)
             ? req.query.scope
             : "upcoming";
