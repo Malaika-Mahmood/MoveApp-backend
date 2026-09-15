@@ -1,487 +1,556 @@
 const pool = require("../config/db");
-const offers = require("../services/bookingOffers");
-const { toBooking, BOOKING_SELECT, BOOKING_JOINS } = require("../services/bookingValidation");
-const { DRIVER_STATUS_STEPS } = require("../constants/bookings");
 const {
-    notifyOfferAccepted,
-    notifyOfferDeclined,
-    notifyJobStatusChanged
+    notifyContactRequest,
+    notifyAccessDecision
 } = require("../services/appNotifications");
+const shareAccess = require("../services/shareAccess");
+const { expiredDocumentsFor } = require("../services/documentExpiry");
 
-// Everything the driver's app does with work: go online, see what has been
-// offered, take it or turn it down, browse the open pool, and move a job
-// along once they have it.
+// UK postcode, e.g. W1U 3BW / SW1A 1AA / M1 1AE
+const POSTCODE_REGEX = /^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$/i;
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+const VALID_TITLES = ["Mr", "Mrs", "Ms"];
+
+const MIN_DRIVER_AGE = 21;   // typical UK private hire minimum
+
+// The driver now types their own National Insurance number on the Personal
+// Information screen. The operator can still correct it during verification
+// (PATCH /operator/drivers/:id/details) by reading it off the uploaded
+// document — a driver mistyping their own NI number is common, and the
+// document is the authority.
 //
-// The id always comes from the token, never the URL. A driver can only ever
-// see and change their own jobs, and there is no endpoint here that takes a
-// driver id at all.
+// This regex is the same one the operator endpoint uses. The prefixes below
+// are never issued by HMRC, and QQ123456C in particular is HMRC's own
+// placeholder — it can never be a real number, so it must be rejected.
+const NI_REGEX = /^(?!BG|GB|KN|NK|NT|TN|ZZ)[A-CEGHJ-PR-TW-Z][A-CEGHJ-NPR-TW-Z]\d{6}[A-D]$/i;
 
-// -----------------------------------------------------------------------------
-// PATCH /api/v1/drivers/me/online   { "is_online": true }
-// -----------------------------------------------------------------------------
-// The Go Online / Offline switch on the home screen. The same fact the
-// operator reads as the AVAILABLE badge.
-const setOnline = async (req, res) => {
+// "AB 12 34 56 C" and "ab123456c" are the same number written differently.
+const normaliseNi = (value) => String(value).replace(/\s+/g, "").toUpperCase();
+
+// NOTE: internal / external driver type has been removed — every driver is
+// treated the same under the universal app model.
+
+// Shape the frontend receives everywhere a driver profile is returned.
+// Keeping it in one function means every endpoint sends the same fields.
+const toProfile = (u) => ({
+    id: u.id,
+    title: u.title,
+    first_name: u.first_name,
+    middle_name: u.middle_name,
+    last_name: u.last_name,
+    full_name: [u.first_name, u.middle_name, u.last_name].filter(Boolean).join(" "),
+    date_of_birth: u.date_of_birth,
+    email: u.email,
+    phone: u.phone,
+    role: u.role,
+    status: u.status,
+    email_verified: u.email_verified,
+    phone_verified: u.phone_verified,
+    address: u.address,
+    postcode: u.postcode,
+
+    // Typed by the driver, correctable by the operator
+    ni_number: u.ni_number,
+
+    // Filled in by the operator from the documents — read-only to the driver
+    driving_licence_number: u.driving_licence_number,
+    pco_licence_number: u.pco_licence_number,
+
+    created_at: u.created_at,
+
+    // The app locks itself on this. A locked driver can still open the document
+    // screens — that is the whole point, they have to be able to fix it — but
+    // everything else is covered over.
+    account_locked: Boolean(u.account_locked),
+    suspension_reason: u.suspension_reason || null,
+    suspended_at: u.suspended_at || null,
+
+    // Onboarding progress, so the app knows which screen to show next
+    // without having to work it out from null checks.
+    onboarding: {
+        personal_info_complete: Boolean(
+            u.title && u.date_of_birth && u.postcode && u.ni_number
+        )
+    }
+});
+
+// GET /api/v1/drivers/me
+const getMe = async (req, res) => {
     try {
+        // authenticate already loaded the row, so no second query is needed
+        const user = toProfile(req.user);
+
+        // The lock screen. Only looked up when the driver is actually locked —
+        // no point running this query on every profile load for the 99% who are
+        // not. It names the documents so the app can say "your MOT expired on
+        // 14.09.2026" instead of "a document expired", which is the difference
+        // between a driver who knows what to do and one who phones the office.
+        if (req.user.account_locked) {
+            user.expired_documents = await expiredDocumentsFor(req.user.id);
+
+            // Once the driver uploads a replacement, the expired file stops
+            // being the current one, so expired_documents empties out — but the
+            // lock stays on until an operator approves the new file. Without
+            // these two fields the app would show a lock screen with nothing on
+            // it and no explanation of what the driver is waiting for.
+            const awaiting = await pool.query(
+                `SELECT id, document_type, uploaded_at
+                 FROM driver_documents
+                 WHERE user_id = $1 AND is_current AND status = 'pending_review'
+                 ORDER BY uploaded_at DESC`,
+                [req.user.id]
+            );
+
+            user.pending_review_documents = awaiting.rows.map((d) => ({
+                document_id: d.id,
+                document_type: d.document_type,
+                uploaded_at: d.uploaded_at
+            }));
+
+            // true  → "Your new document is with an operator. We will let you know."
+            // false → "These documents have expired. Upload a new one."
+            user.replacement_pending =
+                user.expired_documents.length === 0 && awaiting.rows.length > 0;
+        }
+
+        res.status(200).json({ user });
+    } catch (error) {
+        console.error("Error in getMe:", error);
+        res.status(500).json({ message: "Something went wrong while fetching your profile" });
+    }
+};
+
+// PATCH /api/v1/drivers/me/personal
+// Title, middle name, date of birth, NI number, address, postcode.
+//
+// Editable at any time, including after approval — people move house, and
+// making them phone the operator for that would be silly.
+//
+// middle_name is here because Create Account does not force one, and a driver
+// who skipped it there had no way to add it afterwards — while their passport
+// and licence both carry it, which is exactly what the operator is matching
+// against. First and last name are deliberately NOT editable: those are the
+// identity the whole account was opened under.
+const updatePersonalInfo = async (req, res) => {
+    try {
+        const { title, middle_name, date_of_birth, ni_number, address, postcode } = req.body;
+
         if (req.user.role !== "driver") {
             return res.status(403).json({
-                message: "Only drivers go online",
+                message: "Only drivers have a personal information profile",
                 error_code: "FORBIDDEN"
             });
         }
 
-        const { is_online } = req.body || {};
-
-        if (typeof is_online !== "boolean") {
+        if (!title || !date_of_birth || !postcode || !ni_number) {
             return res.status(400).json({
-                message: "is_online must be true or false",
-                error_code: "INVALID_VALUE"
+                message: "title, date_of_birth, ni_number and postcode are required"
             });
         }
 
-        // A driver locked out by an expired document cannot go online. They can
-        // open the app — that is the whole point of the lock, they have to be
-        // able to fix it — but they cannot take work until it is fixed.
-        if (is_online && req.user.account_locked) {
-            return res.status(403).json({
-                message: "Upload your replacement document before going online",
-                error_code: "ACCOUNT_LOCKED"
+        const cleanTitle = String(title).trim();
+        const cleanNi = normaliseNi(ni_number);
+
+        // Three different things the app might send, and they mean three
+        // different things:
+        //
+        //   key absent          leave whatever is stored alone
+        //   ""  or "   "        the driver cleared the field — store NULL
+        //   "Ahmad"             store it
+        //
+        // Without this an app that always sends every field would wipe a middle
+        // name every time the driver saved their address.
+        const middleNameProvided = Object.prototype.hasOwnProperty.call(req.body, "middle_name");
+        let cleanMiddleName;
+
+        if (middleNameProvided) {
+            const trimmed = middle_name === null ? "" : String(middle_name).trim();
+
+            if (trimmed === "") {
+                cleanMiddleName = null;
+            } else {
+                if (trimmed.length < 2 || trimmed.length > 50) {
+                    return res.status(400).json({
+                        message: "middle_name must be between 2 and 50 characters"
+                    });
+                }
+
+                // Letters, spaces, hyphens and apostrophes — enough for
+                // "Anne-Marie" and "O'Brien", nothing else.
+                if (!/^[\p{L}][\p{L}\s'-]*$/u.test(trimmed)) {
+                    return res.status(400).json({
+                        message: "middle_name may only contain letters, spaces, hyphens and apostrophes"
+                    });
+                }
+
+                cleanMiddleName = trimmed;
+            }
+        }
+        const cleanPostcode = String(postcode).trim().toUpperCase();
+        const cleanAddress = address ? String(address).trim() : null;
+
+        if (!VALID_TITLES.includes(cleanTitle)) {
+            return res.status(400).json({
+                message: `title must be one of: ${VALID_TITLES.join(", ")}`
             });
         }
 
-        if (is_online && req.user.status !== "approved") {
-            return res.status(403).json({
-                message: "Your account is not approved for work yet",
-                error_code: "NOT_APPROVED"
+        if (!ISO_DATE.test(String(date_of_birth))) {
+            return res.status(400).json({
+                message: "date_of_birth must be in YYYY-MM-DD format"
             });
         }
 
-        await pool.query(
+        const dob = new Date(`${date_of_birth}T00:00:00Z`);
+        if (Number.isNaN(dob.getTime())) {
+            return res.status(400).json({ message: "date_of_birth is not a valid date" });
+        }
+
+        const age = (Date.now() - dob.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
+
+        if (age < MIN_DRIVER_AGE) {
+            return res.status(400).json({
+                message: `Drivers must be at least ${MIN_DRIVER_AGE} years old`,
+                error_code: "DRIVER_TOO_YOUNG"
+            });
+        }
+
+        if (age > 100) {
+            return res.status(400).json({ message: "date_of_birth does not look correct" });
+        }
+
+        if (!POSTCODE_REGEX.test(cleanPostcode)) {
+            return res.status(400).json({
+                message: "postcode must be a valid UK postcode (e.g. W1U 3BW)"
+            });
+        }
+
+        if (!NI_REGEX.test(cleanNi)) {
+            return res.status(400).json({
+                message: "ni_number must be a valid UK National Insurance number (e.g. AB123456C)",
+                error_code: "INVALID_NI_NUMBER"
+            });
+        }
+
+        // One National Insurance number belongs to one person. Two accounts
+        // sharing one is either a typo or someone using another driver's
+        // identity, and neither should be allowed through quietly.
+        const clash = await pool.query(
+            "SELECT id FROM users WHERE UPPER(ni_number) = $1 AND id <> $2",
+            [cleanNi, req.user.id]
+        );
+
+        if (clash.rows.length > 0) {
+            return res.status(409).json({
+                message: "This National Insurance number is already registered to another account",
+                error_code: "NI_NUMBER_IN_USE"
+            });
+        }
+
+        // middle_name is only touched when the key was actually sent, which is
+        // why it is not a plain COALESCE like address: COALESCE could never
+        // clear it, and here clearing is a real thing a driver may want.
+        const updated = await pool.query(
             `UPDATE users
-             SET is_online = $2,
-                 last_online_at = CASE WHEN $2 THEN NOW() ELSE last_online_at END,
+             SET title = $1, date_of_birth = $2, ni_number = $3,
+                 address = COALESCE($4, address), postcode = $5,
+                 middle_name = CASE WHEN $6 THEN $7 ELSE middle_name END,
                  updated_at = NOW()
-             WHERE id = $1`,
-            [req.user.id, is_online]
+             WHERE id = $8
+             RETURNING *`,
+            [cleanTitle, date_of_birth, cleanNi, cleanAddress, cleanPostcode,
+                middleNameProvided, cleanMiddleName ?? null, req.user.id]
         );
 
         res.status(200).json({
-            message: is_online ? "You are online" : "You are offline",
-            is_online
+            message: "Personal information saved",
+            user: toProfile(updated.rows[0])
         });
 
     } catch (error) {
-        console.error("Error in setOnline:", error);
-        res.status(500).json({ message: "Something went wrong" });
+        if (error.code === "23505") {
+            return res.status(409).json({
+                message: "This National Insurance number is already registered to another account",
+                error_code: "NI_NUMBER_IN_USE"
+            });
+        }
+
+        console.error("Error in updatePersonalInfo:", error);
+        res.status(500).json({ message: "Something went wrong while saving your information" });
     }
 };
 
-// -----------------------------------------------------------------------------
-// GET /api/v1/drivers/me/offers
-// -----------------------------------------------------------------------------
-const listMyOffers = async (req, res) => {
-    try {
-        await offers.expireDueOffers();
+// POST /api/v1/drivers/me/contact-request
+// Body: { message } — optional, up to 300 characters
+//
+// The driver cannot see the operator's phone number or email, so this is how
+// they ask to be contacted: the operator gets a notification and reaches out.
+//
+// WHICH operator is told: the one who last verified any of this driver's
+// documents. That is a stand-in. There is no column yet saying which operator a
+// driver belongs to — the CEO has not decided how that link is formed — and
+// "whoever reviewed you" is the closest true answer today's data can give. When
+// the link exists, only the query below changes.
+//
+// If nobody has reviewed them yet, every admin is told instead, so a request is
+// never simply lost.
+const CONTACT_REQUEST_COOLDOWN_MINUTES = 60;
 
-        const result = await pool.query(
-            `SELECT o.id AS offer_id, o.status AS offer_status,
-                    o.offered_at, o.expires_at,
-                    ${BOOKING_SELECT}
-             FROM booking_offers o
-             JOIN bookings b ON b.id = o.booking_id
-             LEFT JOIN vehicle_classes vc ON vc.id = b.vehicle_class_id
-             LEFT JOIN users d            ON d.id  = b.driver_id
-             LEFT JOIN vehicles v         ON v.id  = b.vehicle_id
-             WHERE o.driver_id = $1 AND o.status = 'pending'
-             ORDER BY o.offered_at DESC`,
+const requestContact = async (req, res) => {
+    try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers can send a contact request",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        const { message } = req.body || {};
+        let cleanMessage = null;
+
+        if (message !== undefined && message !== null && String(message).trim() !== "") {
+            cleanMessage = String(message).trim();
+
+            if (cleanMessage.length > 300) {
+                return res.status(400).json({
+                    message: "message must be 300 characters or fewer"
+                });
+            }
+        }
+
+        // One request an hour. Without it a driver waiting for an answer taps
+        // the button again and again, the operator's bell fills with the same
+        // request, and they stop reading it.
+        const recent = await pool.query(
+            `SELECT created_at FROM notifications
+             WHERE actor_id = $1
+               AND type = 'contact_request'
+               AND created_at > NOW() - make_interval(mins => $2)
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [req.user.id, CONTACT_REQUEST_COOLDOWN_MINUTES]
+        );
+
+        if (recent.rows.length > 0) {
+            const waited = Math.floor(
+                (Date.now() - new Date(recent.rows[0].created_at).getTime()) / 1000
+            );
+
+            return res.status(429).json({
+                message: "You have already asked to be contacted. Please wait for a reply.",
+                error_code: "CONTACT_REQUEST_TOO_SOON",
+                retry_after_seconds: Math.max(0, CONTACT_REQUEST_COOLDOWN_MINUTES * 60 - waited)
+            });
+        }
+
+        const reviewers = await pool.query(
+            `SELECT verified_by, MAX(verified_at) AS last_seen
+             FROM driver_documents
+             WHERE user_id = $1 AND verified_by IS NOT NULL
+             GROUP BY verified_by
+             ORDER BY last_seen DESC
+             LIMIT 1`,
             [req.user.id]
         );
 
-        res.status(200).json({
-            offers: result.rows.map((row) => ({
-                offer_id: row.offer_id,
-                status: row.offer_status,
-                offered_at: row.offered_at,
-                expires_at: row.expires_at,
+        let recipients = reviewers.rows.map((r) => r.verified_by);
 
-                // The client's number is withheld until the driver accepts.
-                // They can see where the job goes and when — everything they
-                // need to decide — but not a phone number for a job they have
-                // not taken.
-                booking: toBooking(row, { includeClientContact: false })
-            })),
-            pending_count: result.rows.length
+        if (recipients.length === 0) {
+            const admins = await pool.query(
+                "SELECT id FROM users WHERE role = 'admin' AND status <> 'suspended'"
+            );
+            recipients = admins.rows.map((r) => r.id);
+        }
+
+        if (recipients.length === 0) {
+            return res.status(503).json({
+                message: "There is nobody available to contact right now. Please try again later.",
+                error_code: "NO_RECIPIENT"
+            });
+        }
+
+        for (const recipientId of recipients) {
+            await notifyContactRequest(recipientId, req.user, cleanMessage);
+        }
+
+        res.status(201).json({
+            message: "Your request has been sent. Someone will contact you shortly.",
+            sent_to: recipients.length
         });
 
     } catch (error) {
-        console.error("Error in listMyOffers:", error);
-        res.status(500).json({ message: "Something went wrong while fetching your offers" });
+        console.error("Error in requestContact:", error);
+        res.status(500).json({ message: "Something went wrong while sending your request" });
     }
 };
 
 // -----------------------------------------------------------------------------
-// PATCH /api/v1/drivers/me/offers/:id   { "decision": "accepted" | "declined" }
+// Share code
 // -----------------------------------------------------------------------------
-const respondToOffer = async (req, res) => {
+// The driver's own ID and PIN, and the requests that arrive because of them.
+//
+// The ID never changes — it is how the driver is known. The PIN is theirs to
+// change whenever they like, which is the only remedy for having given it to
+// somebody they later think better of.
+
+// GET /api/v1/drivers/me/share-code
+const getShareCode = async (req, res) => {
     try {
-        const { id } = req.params;
-        if (!/^\d+$/.test(id)) {
-            return res.status(400).json({ message: "Invalid offer id" });
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers have a share code",
+                error_code: "FORBIDDEN"
+            });
         }
 
-        const { decision, vehicle_id, reason } = req.body || {};
+        const code = await shareAccess.getOrCreateShareCode(req.user.id);
 
-        if (decision !== "accepted" && decision !== "declined") {
+        res.status(200).json({
+            share_id: code.share_id,
+            pin: code.share_pin,
+            pin_updated_at: code.share_pin_updated_at,
+            grant_minutes: shareAccess.GRANT_MINUTES
+        });
+
+    } catch (error) {
+        console.error("Error in getShareCode:", error);
+        res.status(500).json({ message: "Something went wrong while fetching your share code" });
+    }
+};
+
+// POST /api/v1/drivers/me/share-code/pin
+//
+// Body is optional. `{ "pin": "451203" }` sets a chosen one; an empty body
+// gets a random one, which is what a "Generate new PIN" button sends.
+const changeSharePin = async (req, res) => {
+    try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers have a share code",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        const { pin } = req.body || {};
+
+        if (pin !== undefined && pin !== null && !shareAccess.normalisePin(pin)) {
             return res.status(400).json({
-                message: "decision must be 'accepted' or 'declined'",
+                message: "pin must be exactly 6 digits",
+                error_code: "INVALID_PIN"
+            });
+        }
+
+        // Make sure a code exists at all before changing half of it.
+        await shareAccess.getOrCreateShareCode(req.user.id);
+
+        const updated = await shareAccess.changePin(req.user.id, pin ?? null);
+
+        res.status(200).json({
+            message: "PIN updated",
+            share_id: updated.share_id,
+            pin: updated.share_pin,
+            pin_updated_at: updated.share_pin_updated_at
+        });
+
+    } catch (error) {
+        console.error("Error in changeSharePin:", error);
+        res.status(500).json({ message: "Something went wrong while changing your PIN" });
+    }
+};
+
+// GET /api/v1/drivers/me/access-requests
+const listAccessRequests = async (req, res) => {
+    try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers have access requests",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        const requests = await shareAccess.requestsForDriver(req.user.id);
+
+        res.status(200).json({
+            requests,
+            pending_count: requests.filter((r) => r.status === "pending").length
+        });
+
+    } catch (error) {
+        console.error("Error in listAccessRequests:", error);
+        res.status(500).json({ message: "Something went wrong while fetching your access requests" });
+    }
+};
+
+// PATCH /api/v1/drivers/me/access-requests/:id
+// { "decision": "approved" }  or  { "decision": "denied" }
+const decideAccessRequest = async (req, res) => {
+    try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers can answer access requests",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        const { id } = req.params;
+        if (!/^\d+$/.test(id)) {
+            return res.status(400).json({ message: "Invalid request id" });
+        }
+
+        const { decision } = req.body || {};
+        if (decision !== "approved" && decision !== "denied") {
+            return res.status(400).json({
+                message: "decision must be 'approved' or 'denied'",
                 error_code: "INVALID_DECISION"
             });
         }
 
-        const result = await offers.respondToOffer(
-            req.user.id,
-            Number(id),
-            decision,
-            vehicle_id ? Number(vehicle_id) : null
-        );
+        const updated = await shareAccess.decideRequest(req.user.id, Number(id), decision);
 
-        if (result.error) {
-            const status = result.error === "NOT_FOUND" ? 404 : 409;
-            return res.status(status).json({
-                message: result.message,
-                error_code: result.error,
-                offer_status: result.offer_status
+        // 404, not 403 or 409. The request is either not theirs, does not
+        // exist, or has already been answered — and saying which of those it is
+        // would leak other people's requests.
+        if (!updated) {
+            return res.status(404).json({
+                message: "No pending request with that id",
+                error_code: "NOT_FOUND"
             });
         }
 
-        if (decision === "declined" && reason) {
-            await pool.query(
-                "UPDATE booking_offers SET decline_reason = $2 WHERE id = $1",
-                [id, String(reason).slice(0, 255)]
-            );
-        }
-
-        const booking = await pool.query(
-            `SELECT ${BOOKING_SELECT} ${BOOKING_JOINS} WHERE b.id = $1`,
-            [result.booking_id]
-        );
-
-        const driverName = [req.user.first_name, req.user.last_name].filter(Boolean).join(" ");
-
-        if (decision === "accepted") {
-            notifyOfferAccepted(booking.rows[0].created_by_operator_id, result.booking_id, driverName);
-        } else {
-            notifyOfferDeclined(booking.rows[0].created_by_operator_id, result.booking_id, driverName);
-        }
-
-        res.status(200).json({
-            message: decision === "accepted" ? "Job accepted" : "Job declined",
-            // Accepting is what unlocks the client's number — the driver now
-            // has a reason to ring them.
-            booking: toBooking(booking.rows[0], { includeClientContact: decision === "accepted" })
-        });
-
-    } catch (error) {
-        console.error("Error in respondToOffer:", error);
-        res.status(500).json({ message: "Something went wrong while answering the offer" });
-    }
-};
-
-// -----------------------------------------------------------------------------
-// GET /api/v1/drivers/me/available-jobs
-// -----------------------------------------------------------------------------
-// The open pool — "Live Jobs Available Now".
-//
-// Filters match the designer's screen: vehicle class, direction, sort. Distance
-// is not here because driver location does not exist yet; adding a filter that
-// silently does nothing would be worse than leaving it out.
-const listAvailableJobs = async (req, res) => {
-    try {
-        if (req.user.role !== "driver") {
-            return res.status(403).json({ message: "Drivers only", error_code: "FORBIDDEN" });
-        }
-
-        if (req.user.account_locked) {
-            return res.status(403).json({
-                message: "Upload your replacement document to see jobs again",
-                error_code: "ACCOUNT_LOCKED"
-            });
-        }
-
-        await offers.expireDueOffers();
-
-        const where = [
-            "b.is_open_to_all",
-            "b.status = 'pending'",
-            // Only jobs this driver's car can actually do. A list full of work
-            // they cannot take is not a list, it is a tease.
-            `EXISTS (
-                SELECT 1 FROM vehicles v
-                WHERE v.driver_id = $1
-                  AND v.verification_status = 'approved'
-                  AND v.availability_status <> 'inactive'
-                  AND (b.vehicle_class_id IS NULL OR v.vehicle_class = vc.code)
-             )`
-        ];
-        const params = [req.user.id];
-
-        if (req.query.vehicle_class) {
-            params.push(req.query.vehicle_class);
-            where.push(`vc.code = $${params.length}`);
-        }
-
-        // "To Airport" / "From Airport". Matched on the address text, which is
-        // rough, but it is what there is until addresses are structured.
-        if (req.query.direction === "to_airport") {
-            where.push("(b.dropoff_address ILIKE '%airport%' OR b.dropoff_address ILIKE '%terminal%')");
-        } else if (req.query.direction === "from_airport") {
-            where.push("(b.pickup_address ILIKE '%airport%' OR b.pickup_address ILIKE '%terminal%')");
-        }
-
-        const order = req.query.sort === "soonest" || !req.query.sort
-            ? "COALESCE(b.scheduled_at, b.created_at) ASC"
-            : "b.created_at DESC";
-
-        const result = await pool.query(
-            `SELECT ${BOOKING_SELECT} ${BOOKING_JOINS}
-             WHERE ${where.join(" AND ")}
-             ORDER BY ${order}
-             LIMIT 50`,
-            params
+        await notifyAccessDecision(
+            updated.operator_id,
+            [req.user.first_name, req.user.last_name].filter(Boolean).join(" "),
+            decision === "approved",
+            updated.id
         );
 
         res.status(200).json({
-            jobs: result.rows.map((b) => toBooking(b, { includeClientContact: false })),
-            total: result.rows.length,
-            // Said plainly rather than left for the frontend to discover.
-            notes: {
-                distance_filter: "Not available yet — driver location is not tracked"
+            message: decision === "approved"
+                ? `Access allowed for ${shareAccess.GRANT_MINUTES} minutes`
+                : "Access denied",
+            request: {
+                id: updated.id,
+                status: updated.status,
+                decided_at: updated.decided_at,
+                expires_at: updated.expires_at
             }
         });
 
     } catch (error) {
-        console.error("Error in listAvailableJobs:", error);
-        res.status(500).json({ message: "Something went wrong while fetching jobs" });
-    }
-};
-
-// -----------------------------------------------------------------------------
-// POST /api/v1/drivers/me/available-jobs/:id/claim
-// -----------------------------------------------------------------------------
-const claimJob = async (req, res) => {
-    try {
-        const { id } = req.params;
-        if (!/^\d+$/.test(id)) {
-            return res.status(400).json({ message: "Invalid job id" });
-        }
-
-        if (req.user.account_locked) {
-            return res.status(403).json({
-                message: "Upload your replacement document before taking jobs",
-                error_code: "ACCOUNT_LOCKED"
-            });
-        }
-
-        const { vehicle_id } = req.body || {};
-
-        const result = await offers.claimOpenJob(
-            req.user.id,
-            Number(id),
-            vehicle_id ? Number(vehicle_id) : null
-        );
-
-        if (result.error) {
-            const status = result.error === "NOT_FOUND" ? 404 : 409;
-            return res.status(status).json({ message: result.message, error_code: result.error });
-        }
-
-        const booking = await pool.query(
-            `SELECT ${BOOKING_SELECT} ${BOOKING_JOINS} WHERE b.id = $1`,
-            [result.booking_id]
-        );
-
-        const driverName = [req.user.first_name, req.user.last_name].filter(Boolean).join(" ");
-        notifyOfferAccepted(booking.rows[0].created_by_operator_id, result.booking_id, driverName);
-
-        res.status(200).json({
-            message: "Job is yours",
-            booking: toBooking(booking.rows[0])
-        });
-
-    } catch (error) {
-        console.error("Error in claimJob:", error);
-        res.status(500).json({ message: "Something went wrong while taking the job" });
-    }
-};
-
-// -----------------------------------------------------------------------------
-// GET /api/v1/drivers/me/jobs?scope=upcoming|today|past|active
-// -----------------------------------------------------------------------------
-const listMyJobs = async (req, res) => {
-    try {
-        const scope = ["upcoming", "today", "past", "active"].includes(req.query.scope)
-            ? req.query.scope
-            : "upcoming";
-
-        const where = ["b.driver_id = $1"];
-        const params = [req.user.id];
-
-        if (scope === "active") {
-            where.push("b.status IN ('accepted','en_route','arrived','in_progress')");
-        } else if (scope === "today") {
-            where.push("COALESCE(b.scheduled_at, b.created_at)::date = CURRENT_DATE");
-        } else if (scope === "upcoming") {
-            where.push("b.status NOT IN ('completed','cancelled')");
-        } else {
-            where.push("b.status IN ('completed','cancelled')");
-        }
-
-        const order = scope === "past"
-            ? "COALESCE(b.completed_at, b.cancelled_at, b.created_at) DESC"
-            : "COALESCE(b.scheduled_at, b.created_at) ASC";
-
-        const result = await pool.query(
-            `SELECT ${BOOKING_SELECT} ${BOOKING_JOINS}
-             WHERE ${where.join(" AND ")}
-             ORDER BY ${order}
-             LIMIT 100`,
-            params
-        );
-
-        res.status(200).json({
-            scope,
-            jobs: result.rows.map((b) => toBooking(b)),
-            total: result.rows.length
-        });
-
-    } catch (error) {
-        console.error("Error in listMyJobs:", error);
-        res.status(500).json({ message: "Something went wrong while fetching your jobs" });
-    }
-};
-
-// -----------------------------------------------------------------------------
-// GET /api/v1/drivers/me/jobs/:id
-// -----------------------------------------------------------------------------
-const getMyJob = async (req, res) => {
-    try {
-        const { id } = req.params;
-        if (!/^\d+$/.test(id)) {
-            return res.status(400).json({ message: "Invalid job id" });
-        }
-
-        const result = await pool.query(
-            `SELECT ${BOOKING_SELECT},
-                    o.first_name AS operator_first_name,
-                    o.last_name  AS operator_last_name
-             ${BOOKING_JOINS}
-             LEFT JOIN users o ON o.id = b.created_by_operator_id
-             WHERE b.id = $1 AND b.driver_id = $2`,
-            [id, req.user.id]
-        );
-
-        const booking = result.rows[0];
-        if (!booking) {
-            return res.status(404).json({ message: "No job with that id", error_code: "NOT_FOUND" });
-        }
-
-        const shaped = toBooking(booking);
-
-        // The driver is told who they are working for — name and company, no
-        // number. That is not a break in the masking rule: masking was always
-        // about contact details. Somebody doing a job should know who gave it
-        // to them.
-        shaped.operator = {
-            id: booking.created_by_operator_id,
-            full_name: [booking.operator_first_name, booking.operator_last_name]
-                .filter(Boolean).join(" "),
-            phone: null,
-            contact_masked: true
-        };
-
-        // What the driver's button should say next.
-        const nextStep = {
-            accepted: "en_route",
-            en_route: "arrived",
-            arrived: "in_progress",
-            in_progress: "completed"
-        }[booking.status] || null;
-
-        shaped.next_status = nextStep;
-
-        res.status(200).json({ booking: shaped });
-
-    } catch (error) {
-        console.error("Error in getMyJob:", error);
-        res.status(500).json({ message: "Something went wrong while fetching the job" });
-    }
-};
-
-// -----------------------------------------------------------------------------
-// PATCH /api/v1/drivers/me/jobs/:id/status   { "status": "en_route" }
-// -----------------------------------------------------------------------------
-const updateJobStatus = async (req, res) => {
-    try {
-        const { id } = req.params;
-        if (!/^\d+$/.test(id)) {
-            return res.status(400).json({ message: "Invalid job id" });
-        }
-
-        const { status } = req.body || {};
-        const allowed = Object.keys(DRIVER_STATUS_STEPS);
-
-        if (!allowed.includes(status)) {
-            return res.status(400).json({
-                message: `status must be one of: ${allowed.join(", ")}`,
-                error_code: "INVALID_STATUS"
-            });
-        }
-
-        const result = await offers.updateJobStatus(req.user.id, Number(id), status);
-
-        if (result.error) {
-            const code = result.error === "NOT_FOUND" ? 404 : 409;
-            return res.status(code).json({
-                message: result.message,
-                error_code: result.error,
-                current_status: result.current_status
-            });
-        }
-
-        const booking = await pool.query(
-            `SELECT ${BOOKING_SELECT} ${BOOKING_JOINS} WHERE b.id = $1`,
-            [id]
-        );
-
-        notifyJobStatusChanged(
-            booking.rows[0].created_by_operator_id,
-            Number(id),
-            status,
-            [req.user.first_name, req.user.last_name].filter(Boolean).join(" ")
-        );
-
-        // The client's SMS hangs off this same moment — see Part C. Nothing is
-        // sent yet; when it is, it goes here, and a failure to send must never
-        // stop the driver's status changing.
-
-        res.status(200).json({
-            message: "Status updated",
-            booking: toBooking(booking.rows[0])
-        });
-
-    } catch (error) {
-        console.error("Error in updateJobStatus:", error);
-        res.status(500).json({ message: "Something went wrong while updating the job" });
+        console.error("Error in decideAccessRequest:", error);
+        res.status(500).json({ message: "Something went wrong while answering the request" });
     }
 };
 
 module.exports = {
-    setOnline,
-    listMyOffers,
-    respondToOffer,
-    listAvailableJobs,
-    claimJob,
-    listMyJobs,
-    getMyJob,
-    updateJobStatus
+    getMe,
+    updatePersonalInfo,
+    requestContact,
+    getShareCode,
+    changeSharePin,
+    listAccessRequests,
+    decideAccessRequest,
+    toProfile
 };
