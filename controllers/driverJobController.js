@@ -220,7 +220,7 @@ const listAvailableJobs = async (req, res) => {
                 WHERE v.driver_id = $1
                   AND v.verification_status = 'approved'
                   AND v.availability_status <> 'inactive'
-                  AND (b.vehicle_class_id IS NULL OR v.vehicle_class = vc.code)
+                  AND (b.vehicle_class_id IS NULL OR v.vehicle_class_id = b.vehicle_class_id)
              )`
         ];
         const params = [req.user.id];

@@ -37,6 +37,11 @@ const {
 // the driver's car has to be that class and have passed verification. This is
 // also the only place the fleet question is settled — a company car and an
 // outside driver's car are judged by exactly the same rule.
+//
+// Matched on vehicle_class_id, never on the old free-text vehicle_class. One
+// driver wrote "Executive Saloon" where the class list says "saloon", and
+// string comparison found nothing — no error, just an empty list of drivers
+// and no clue why. See migration 015.
 const loadAssignableDriver = async (client, driverId, booking) => {
     const result = await client.query(
         `SELECT u.id, u.first_name, u.last_name, u.status,
@@ -47,11 +52,11 @@ const loadAssignableDriver = async (client, driverId, booking) => {
                 ON v.driver_id = u.id
                AND v.verification_status = 'approved'
                AND v.availability_status <> 'inactive'
-               AND ($2::text IS NULL OR v.vehicle_class = $2)
+               AND ($2::int IS NULL OR v.vehicle_class_id = $2)
          WHERE u.id = $1 AND u.role = 'driver'
          ORDER BY v.id ASC
          LIMIT 1`,
-        [driverId, booking.vehicle_class_code || null]
+        [driverId, booking.vehicle_class_id || null]
     );
 
     return result.rows[0] || null;

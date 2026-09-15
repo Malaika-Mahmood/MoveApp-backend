@@ -52,9 +52,10 @@ const getAvailableDrivers = async (req, res) => {
         ];
         const params = [];
 
-        // The car has to be the right class. This is the only test that
-        // matters, and it is deliberately blind to who owns the car.
-        params.push(booking.vehicle_class_code || null);
+        // The car has to be the right class — by id, not by the old free-text
+        // column, which nobody ever typed the same way twice. Deliberately
+        // blind to who owns the car.
+        params.push(booking.vehicle_class_id || null);
         const classParam = `$${params.length}`;
 
         if (tab === "fleet") {
@@ -88,7 +89,7 @@ const getAvailableDrivers = async (req, res) => {
                ON v.driver_id = u.id
               AND v.verification_status = 'approved'
               AND v.availability_status <> 'inactive'
-              AND (${classParam}::text IS NULL OR v.vehicle_class = ${classParam}::text)
+              AND (${classParam}::int IS NULL OR v.vehicle_class_id = ${classParam}::int)
              LEFT JOIN company_drivers cf
                ON cf.driver_id = u.id AND cf.removed_at IS NULL
              LEFT JOIN operator_favourite_drivers fav
@@ -276,13 +277,13 @@ const publishBooking = async (req, res) => {
              JOIN vehicles v ON v.driver_id = u.id
                             AND v.verification_status = 'approved'
                             AND v.availability_status <> 'inactive'
-                            AND ($2::text IS NULL OR v.vehicle_class = $2)
+                            AND ($2::int IS NULL OR v.vehicle_class_id = $2)
              WHERE u.role = 'driver'
                AND u.status = 'approved'
                AND u.is_online
                AND u.suspension_reason IS DISTINCT FROM 'document_expired'
                AND u.id <> $1`,
-            [req.user.id, booking.vehicle_class_code || null]
+            [req.user.id, booking.vehicle_class_id || null]
         );
 
         for (const row of eligible.rows) {
