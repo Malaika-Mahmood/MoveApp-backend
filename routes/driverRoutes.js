@@ -15,6 +15,16 @@ const {
     getMyDocuments,
     getMyDocumentsPdf
 } = require("../controllers/documentController");
+const {
+    setOnline,
+    listMyOffers,
+    respondToOffer,
+    listAvailableJobs,
+    claimJob,
+    listMyJobs,
+    getMyJob,
+    updateJobStatus
+} = require("../controllers/driverJobController");
 const authenticate = require("../middleware/authenticate");
 const uploadFile = require("../middleware/uploadFile");
 
@@ -46,6 +56,28 @@ router.post("/me/share-code/pin", authenticate, changeSharePin);
 
 router.get("/me/access-requests", authenticate, listAccessRequests);
 router.patch("/me/access-requests/:id", authenticate, decideAccessRequest);
+
+// Work
+//
+// Every one of these is "the driver who is logged in" — no driver id appears
+// in any path, so there is no shape of request that could reach another
+// driver's jobs.
+//
+// A driver locked out by an expired document is turned away from these
+// individually rather than by a blanket middleware, because the SAME token
+// must still reach the document screens above. That was the point of letting
+// them in at all.
+router.patch("/me/online", authenticate, setOnline);
+
+router.get("/me/offers", authenticate, listMyOffers);
+router.patch("/me/offers/:id", authenticate, respondToOffer);
+
+router.get("/me/available-jobs", authenticate, listAvailableJobs);
+router.post("/me/available-jobs/:id/claim", authenticate, claimJob);
+
+router.get("/me/jobs", authenticate, listMyJobs);
+router.get("/me/jobs/:id", authenticate, getMyJob);
+router.patch("/me/jobs/:id/status", authenticate, updateJobStatus);
 
 // REMOVED: PATCH /me/type — internal vs external no longer exists.
 

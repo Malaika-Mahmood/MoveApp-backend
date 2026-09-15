@@ -1,5 +1,9 @@
 const pool = require("../config/db");
-const { NOTIFICATION_TYPES, isValidNotificationType } = require("../constants/notifications");
+const {
+    NOTIFICATION_TYPES,
+    isValidNotificationType,
+    categoryFor
+} = require("../constants/notifications");
 
 // In-app notifications — the bell icon.
 //
@@ -33,11 +37,13 @@ const create = async ({ userId, actorId = null, type, title, body = null, data =
     // Nobody needs telling about something they did themselves.
     if (actorId && Number(actorId) === Number(userId)) return null;
 
+    // The category is worked out from the type rather than passed in, so no
+    // caller can put a job notification in the wrong tab of the driver's inbox.
     const result = await pool.query(
-        `INSERT INTO notifications (user_id, actor_id, type, title, body, data)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO notifications (user_id, actor_id, type, title, body, data, category)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING *`,
-        [userId, actorId, type, title, body, JSON.stringify(data)]
+        [userId, actorId, type, title, body, JSON.stringify(data), categoryFor(type)]
     );
 
     return result.rows[0];
@@ -157,8 +163,120 @@ const notifyAccessDecision = (operatorId, driverName, approved, requestId) =>
         })
     );
 
+// -----------------------------------------------------------------------------
+// Work
+// -----------------------------------------------------------------------------
+
+// A job has been put to this driver.
+//
+// Like access_request, this one carries requires_decision — the app renders it
+// with Accept and Decline, not as a line of text. Both buttons send the
+// offer_id back.
+const notifyJobOffered = (driverId, bookingId, offerId, expiresInMinutes) =>
+    safely("job_offered", async () =>
+        create({
+            userId: driverId,
+            type: NOTIFICATION_TYPES.JOB_OFFERED,
+            title: "New job offer",
+            body: expiresInMinutes
+                ? `Respond within ${expiresInMinutes} minutes.`
+                : "Tap to see the details.",
+            data: {
+                booking_id: bookingId,
+                offer_id: offerId,
+                requires_decision: true,
+                expires_in_minutes: expiresInMinutes || null
+            }
+        })
+    );
+
+// A job has gone into the open pool. Sent only to drivers who are online and
+// whose car fits — see publishBooking.
+const notifyJobPublished = (driverId, bookingId) =>
+    safely("job_published", async () =>
+        create({
+            userId: driverId,
+            type: NOTIFICATION_TYPES.JOB_PUBLISHED,
+            title: "A job is available",
+            body: "First to accept takes it.",
+            data: { booking_id: bookingId }
+        })
+    );
+
+const notifyOfferWithdrawn = (driverId, bookingId) =>
+    safely("offer_withdrawn", async () =>
+        create({
+            userId: driverId,
+            type: NOTIFICATION_TYPES.OFFER_WITHDRAWN,
+            title: "A job offer was withdrawn",
+            body: "The operator has given it to someone else.",
+            data: { booking_id: bookingId }
+        })
+    );
+
+// The operator hears back. Without these they are watching a screen that
+// never changes — which is exactly what the phone call used to solve.
+const notifyOfferAccepted = (operatorId, bookingId, driverName) =>
+    safely("job_accepted", async () =>
+        create({
+            userId: operatorId,
+            type: NOTIFICATION_TYPES.JOB_ACCEPTED,
+            title: `${driverName} accepted the job`,
+            body: null,
+            data: { booking_id: bookingId }
+        })
+    );
+
+const notifyOfferDeclined = (operatorId, bookingId, driverName) =>
+    safely("job_declined", async () =>
+        create({
+            userId: operatorId,
+            type: NOTIFICATION_TYPES.JOB_DECLINED,
+            title: `${driverName} declined the job`,
+            body: "The booking is unassigned again.",
+            data: { booking_id: bookingId }
+        })
+    );
+
+// Wording the operator can read at a glance from across the office.
+const JOB_STATUS_WORDS = {
+    en_route: "is on the way to the pickup",
+    arrived: "has arrived at the pickup",
+    in_progress: "has the passenger on board",
+    completed: "has completed the job"
+};
+
+const notifyJobStatusChanged = (operatorId, bookingId, status, driverName) =>
+    safely("job_status_changed", async () =>
+        create({
+            userId: operatorId,
+            type: NOTIFICATION_TYPES.JOB_STATUS_CHANGED,
+            title: `${driverName} ${JOB_STATUS_WORDS[status] || `moved the job to ${status}`}`,
+            body: null,
+            data: { booking_id: bookingId, status }
+        })
+    );
+
+const notifyJobCancelled = (driverId, bookingId, reference) =>
+    safely("job_cancelled", async () =>
+        create({
+            userId: driverId,
+            type: NOTIFICATION_TYPES.JOB_CANCELLED,
+            title: `Job ${reference} has been cancelled`,
+            body: null,
+            data: { booking_id: bookingId }
+        })
+    );
+
 module.exports = {
     create,
+    notifyJobOffered,
+    notifyJobPublished,
+    notifyOfferWithdrawn,
+    notifyOfferAccepted,
+    notifyOfferDeclined,
+    notifyJobStatusChanged,
+    notifyJobCancelled,
     sentWithinLastDay,
     notifyDocumentsViewed,
     notifyContactRequest,

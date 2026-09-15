@@ -9,6 +9,14 @@ const {
     cancelBooking
 } = require("../controllers/bookingController");
 
+const {
+    getAvailableDrivers,
+    offerBooking,
+    withdrawBookingOffer,
+    publishBooking,
+    unpublishBooking
+} = require("../controllers/bookingAssignmentController");
+
 const authenticate = require("../middleware/authenticate");
 const authorize = require("../middleware/authorize");
 const requireApprovedOperator = require("../middleware/requireApprovedOperator");
@@ -33,6 +41,16 @@ router.get("/", listBookings);
 // fixed path above the parameterised one is what stops the version of this
 // bug that does bite.
 router.patch("/:id/cancel", cancelBooking);
+
+// Assignment. All declared before the bare "/:id" routes, for the same habit:
+// fixed segments above parameterised ones.
+router.get("/:id/available-drivers", getAvailableDrivers);
+
+router.post("/:id/offer", offerBooking);
+router.delete("/:id/offer", withdrawBookingOffer);
+
+router.post("/:id/publish", publishBooking);
+router.delete("/:id/publish", unpublishBooking);
 
 router.get("/:id", getBooking);
 router.patch("/:id", updateBooking);

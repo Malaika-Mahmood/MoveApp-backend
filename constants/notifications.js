@@ -30,8 +30,46 @@ const NOTIFICATION_TYPES = {
     // product that the app must not simply display — it needs two buttons.
     ACCESS_REQUEST: "access_request",
     ACCESS_GRANTED: "access_granted",
-    ACCESS_DENIED: "access_denied"
+    ACCESS_DENIED: "access_denied",
+
+    // Work. JOB_OFFERED is the second notification in the product that the
+    // app must render with buttons rather than as a line of text — see
+    // requires_decision.
+    JOB_OFFERED: "job_offered",
+    JOB_PUBLISHED: "job_published",
+    OFFER_WITHDRAWN: "offer_withdrawn",
+    OFFER_EXPIRED: "offer_expired",
+    JOB_ACCEPTED: "job_accepted",
+    JOB_DECLINED: "job_declined",
+    JOB_STATUS_CHANGED: "job_status_changed",
+    JOB_CANCELLED: "job_cancelled"
 };
+
+// Which tab of the driver's Inbox a notification belongs in: All / Jobs /
+// Payments / System.
+//
+// Decided here rather than in the app, so that adding a type is one change in
+// one file. An app switching on type would need releasing every time.
+const NOTIFICATION_CATEGORIES = {
+    JOBS: "jobs",
+    PAYMENTS: "payments",
+    SYSTEM: "system"
+};
+
+const CATEGORY_BY_TYPE = {
+    job_offered: "jobs",
+    job_published: "jobs",
+    offer_withdrawn: "jobs",
+    offer_expired: "jobs",
+    job_accepted: "jobs",
+    job_declined: "jobs",
+    job_status_changed: "jobs",
+    job_cancelled: "jobs"
+    // Everything else — documents, access requests, account changes — is
+    // system. That is the default below rather than a list to keep in step.
+};
+
+const categoryFor = (type) => CATEGORY_BY_TYPE[type] || NOTIFICATION_CATEGORIES.SYSTEM;
 
 const ALL_NOTIFICATION_TYPES = Object.values(NOTIFICATION_TYPES);
 
@@ -39,6 +77,8 @@ const isValidNotificationType = (type) => ALL_NOTIFICATION_TYPES.includes(type);
 
 module.exports = {
     NOTIFICATION_TYPES,
+    NOTIFICATION_CATEGORIES,
+    categoryFor,
     ALL_NOTIFICATION_TYPES,
     isValidNotificationType
 };
