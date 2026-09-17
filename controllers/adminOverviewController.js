@@ -109,10 +109,14 @@ const getDashboard = async (req, res) => {
                 -- Documents that expire in the next 30 days, across every
                 -- driver. The daily job warns the drivers themselves; this is
                 -- so the office can see it coming.
+                -- The column is expires_at, not expiry_date. Cast to ::date
+                -- because it is compared against CURRENT_DATE, and a bare
+                -- timestamp comparison would quietly miss everything expiring
+                -- later on the thirtieth day.
                 (SELECT COUNT(*)::int FROM driver_documents
                   WHERE is_current
-                    AND expiry_date IS NOT NULL
-                    AND expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE + 30)
+                    AND expires_at IS NOT NULL
+                    AND expires_at::date BETWEEN CURRENT_DATE AND CURRENT_DATE + 30)
                                                                      AS documents_expiring_30d`
         );
 
@@ -465,7 +469,12 @@ const getDriverDetail = async (req, res) => {
         );
 
         const documents = await pool.query(
-            `SELECT id, document_type, status, expiry_date, uploaded_at
+            `SELECT id, document_type, status, expires_at, uploaded_at,
+                    -- Worked out in the database rather than in JavaScript.
+                    -- The app was comparing a date string against today's
+                    -- string, which happens to work until somebody changes
+                    -- how dates are returned. Postgres knows what a date is.
+                    (expires_at IS NOT NULL AND expires_at::date < CURRENT_DATE) AS expired
                FROM driver_documents
               WHERE user_id = $1 AND is_current
               ORDER BY document_type`,
@@ -544,12 +553,10 @@ const getDriverDetail = async (req, res) => {
 
             vehicles: vehicles.rows,
 
-            documents: documents.rows.map((d) => ({
-                ...d,
-                // Said plainly rather than left for the app to compute from a
-                // date and get wrong at the boundary.
-                expired: Boolean(d.expiry_date) && d.expiry_date < new Date().toISOString().slice(0, 10)
-            })),
+            // expired comes back from the query above, said plainly rather
+            // than left for the app to work out from a date and get wrong at
+            // the boundary.
+            documents: documents.rows,
 
             work: {
                 ...work.rows[0],
