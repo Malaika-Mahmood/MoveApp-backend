@@ -291,9 +291,16 @@ const publishBooking = async (req, res) => {
 
         const booking = await loadBooking(Number(id));
 
-        // Told to every driver who is online and could actually take it.
-        // Telling the ones who cannot would be noise, and drivers who are
-        // buzzed about jobs they cannot do stop reading the notifications.
+        // Told to every driver who could actually take it — online or not.
+        //
+        // This used to be online drivers only. The CEO's decision on 16
+        // September was that a driver sitting at home must still see what work
+        // is coming in, and a driver who is not told cannot see it. The
+        // notification simply waits in their inbox until they next open the
+        // app, which is exactly what somebody browsing from home wants.
+        //
+        // Still filtered by whether the car fits. Buzzing a driver about jobs
+        // they cannot take is how drivers learn to ignore notifications.
         const eligible = await pool.query(
             `SELECT DISTINCT u.id
              FROM users u
@@ -303,7 +310,6 @@ const publishBooking = async (req, res) => {
                             AND ($2::int IS NULL OR v.vehicle_class_id = $2)
              WHERE u.role = 'driver'
                AND u.status = 'approved'
-               AND u.is_online
                AND u.suspension_reason IS DISTINCT FROM 'document_expired'
                AND u.id <> $1`,
             [req.user.id, booking.vehicle_class_id || null]
