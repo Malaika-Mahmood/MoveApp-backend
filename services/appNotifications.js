@@ -268,6 +268,50 @@ const notifyJobCancelled = (driverId, bookingId, reference) =>
         })
     );
 
+// -----------------------------------------------------------------------------
+// Ratings
+// -----------------------------------------------------------------------------
+
+// Somebody has rated you.
+//
+// The rater is NOT named, in either direction. A driver who could see that a
+// particular operator gave them two stars would go and argue about it, and
+// that operator would quietly stop rating honestly. The office can see who
+// gave what; the person rated sees the score and the reasons.
+//
+// The score IS included. "You have been rated" with the number withheld is
+// worse than saying nothing — it sends somebody to the app in a panic.
+const notifyRatingReceived = (subjectId, reference, score, reasons = []) =>
+    safely("rating_received", async () =>
+        create({
+            userId: subjectId,
+            type: NOTIFICATION_TYPES.RATING_RECEIVED,
+            title: `You received a ${score}-star rating`,
+            body: reasons.length
+                ? `For job ${reference}. Tap to see what was noted.`
+                : `For job ${reference}.`,
+            // No rater id in here. It is not shown, so it is not sent: a value
+            // that reaches the phone is a value that can be read off it.
+            data: { reference, score, reasons }
+        })
+    );
+
+// The job is finished — now please rate it.
+//
+// Sent once, when the job completes, to both sides. Never repeated: a system
+// that nags for ratings collects ratings given to stop the nagging, and those
+// are worth nothing.
+const notifyRatingDue = (userId, bookingId, reference) =>
+    safely("rating_reminder", async () =>
+        create({
+            userId,
+            type: NOTIFICATION_TYPES.RATING_REMINDER,
+            title: `How did job ${reference} go?`,
+            body: "Leave a rating — it only takes a moment.",
+            data: { booking_id: bookingId, reference }
+        })
+    );
+
 module.exports = {
     create,
     notifyJobOffered,
@@ -282,5 +326,7 @@ module.exports = {
     notifyContactRequest,
     notifyExpiryLockCleared,
     notifyAccessRequest,
-    notifyAccessDecision
+    notifyAccessDecision,
+    notifyRatingReceived,
+    notifyRatingDue
 };

@@ -42,7 +42,15 @@ const NOTIFICATION_TYPES = {
     JOB_ACCEPTED: "job_accepted",
     JOB_DECLINED: "job_declined",
     JOB_STATUS_CHANGED: "job_status_changed",
-    JOB_CANCELLED: "job_cancelled"
+    JOB_CANCELLED: "job_cancelled",
+
+    // Somebody rated you for a completed job. Goes to both sides — a driver
+    // rated by an operator, and an operator rated by a driver.
+    RATING_RECEIVED: "rating_received",
+
+    // Your job is finished and the other side is waiting on your rating. Sent
+    // once, not nagged.
+    RATING_REMINDER: "rating_reminder"
 };
 
 // Which tab of the driver's Inbox a notification belongs in: All / Jobs /
@@ -64,7 +72,12 @@ const CATEGORY_BY_TYPE = {
     job_accepted: "jobs",
     job_declined: "jobs",
     job_status_changed: "jobs",
-    job_cancelled: "jobs"
+    job_cancelled: "jobs",
+
+    // A rating is about a job, so it belongs in the Jobs tab rather than
+    // System — that is where somebody will go looking for it.
+    rating_received: "jobs",
+    rating_reminder: "jobs"
     // Everything else — documents, access requests, account changes — is
     // system. That is the default below rather than a list to keep in step.
 };

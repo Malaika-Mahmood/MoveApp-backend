@@ -530,8 +530,44 @@ const updateJobStatus = async (driverId, bookingId, nextStatus) => {
             [bookingId, nextStatus]
         );
 
+        // "847 trips" on the driver's profile.
+        //
+        // Counted here, inside the same transaction as the status change, so
+        // the number can never disagree with the bookings it is counting. A
+        // separate UPDATE afterwards could fail on its own and leave a driver
+        // permanently one trip short, which is the kind of thing a driver
+        // notices and nobody can explain.
+        //
+        // Only on completion. Accepting a job is not doing one, and a job
+        // cancelled halfway must not count — the transition rules above make
+        // completed a one-way door, so this cannot run twice for the same job.
+        if (nextStatus === BOOKING_STATUS.COMPLETED) {
+            await client.query(
+                `UPDATE users
+                    SET completed_trips = completed_trips + 1,
+                        updated_at = NOW()
+                  WHERE id = $1`,
+                [driverId]
+            );
+        }
+
         await client.query("COMMIT");
-        return { updated: true, status: nextStatus };
+
+        return {
+            updated: true,
+            status: nextStatus,
+
+            // Told to the caller so it can send both sides their "how did it
+            // go?" notification. Raised in the controller rather than here:
+            // this file's job is the database, notifications are a side
+            // effect and belong outside the transaction.
+            completed: nextStatus === BOOKING_STATUS.COMPLETED,
+            booking: {
+                id: booking.id,
+                reference: booking.reference,
+                operator_id: booking.created_by_operator_id
+            }
+        };
 
     } catch (error) {
         await client.query("ROLLBACK").catch(() => { });

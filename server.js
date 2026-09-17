@@ -14,6 +14,8 @@ const notificationRoutes = require("./routes/notificationRoutes");
 const cronRoutes = require("./routes/cronRoutes");
 const bookingRoutes = require("./routes/bookingRoutes");
 const vehicleClassRoutes = require("./routes/vehicleClassRoutes");
+const favouriteRoutes = require("./routes/favouriteRoutes");
+const ratingRoutes = require("./routes/ratingRoutes");
 
 const app = express();
 
@@ -44,6 +46,10 @@ app.use("/api/v1/operators", operatorProfileRoutes);
 // router. Specific before general.
 app.use("/api/v1/operator/bookings", bookingRoutes);
 
+// Favourites — the star on the assignment screen. Mounted before
+// "/api/v1/operator" for exactly the same reason as bookings above.
+app.use("/api/v1/operator/favourite-drivers", favouriteRoutes);
+
 app.use("/api/v1/operator", operatorRoutes);
 
 // Admins
@@ -57,6 +63,13 @@ app.use("/api/v1/notifications", notificationRoutes);
 
 // Vehicle classes — a lookup table every role reads
 app.use("/api/v1/vehicle-classes", vehicleClassRoutes);
+
+// Ratings — one router for both directions. An operator rating a driver and a
+// driver rating an operator are the same operation with the sides swapped, so
+// they share endpoints rather than being duplicated under /operator and
+// /drivers/me. Every role is let in; each endpoint decides what its caller
+// may see.
+app.use("/api/v1/ratings", ratingRoutes);
 
 
 // Scheduled jobs.

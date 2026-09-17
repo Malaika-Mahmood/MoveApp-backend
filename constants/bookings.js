@@ -95,6 +95,73 @@ const offerTimeoutFor = (bookingType) =>
     OFFER_TIMEOUT_MINUTES[bookingType] ?? null;
 
 // -----------------------------------------------------------------------------
+// Ratings
+// -----------------------------------------------------------------------------
+// A score on its own tells you almost nothing. "Three stars" could mean the
+// driver was late, or rude, or turned up in jeans — and those are three
+// different conversations. So a rating may carry reasons.
+//
+// A fixed list rather than free text, because free text cannot be counted. The
+// question the office will actually ask is "how often is this driver marked
+// down for dress code?", and that is only answerable if everybody picks from
+// the same words.
+//
+// Two lists, because the things that go wrong with a driver are not the things
+// that go wrong with an operator.
+const RATING_REASONS = {
+    // Operator rating the driver
+    operator: [
+        "dress_code",          // not in a suit — this is where the photo feature lands
+        "late",
+        "vehicle_condition",
+        "communication",
+        "driving",
+        "professional"
+    ],
+
+    // Driver rating the operator
+    driver: [
+        "clear_instructions",
+        "communication",
+        "wrong_details",       // bad address, wrong number, wrong time
+        "payment"
+    ]
+};
+
+// The words shown to whoever is picking. Kept beside the codes so the app does
+// not invent its own wording and end up saying something different from the
+// reports.
+const RATING_REASON_LABELS = {
+    dress_code: "Dress code",
+    late: "Late",
+    vehicle_condition: "Vehicle condition",
+    communication: "Communication",
+    driving: "Driving",
+    professional: "Professionalism",
+    clear_instructions: "Clear instructions",
+    wrong_details: "Wrong booking details",
+    payment: "Payment"
+};
+
+const reasonsFor = (raterRole) => RATING_REASONS[raterRole] || [];
+
+const isValidReason = (raterRole, reason) => reasonsFor(raterRole).includes(reason);
+
+// How long after a job somebody may still rate it.
+//
+// A rating given three months later is not a memory, it is a grudge. Seven days
+// covers a Monday job rated at the weekend, which is the real case.
+const RATING_WINDOW_DAYS = 7;
+
+// A cap so a malformed request cannot write a thousand-element array. Nobody
+// picking honestly will reach it.
+const MAX_RATING_REASONS = 6;
+
+// Matches the column width in migration 016. A note, not an essay — a long
+// complaint belongs in Report an Issue.
+const MAX_RATING_COMMENT = 500;
+
+// -----------------------------------------------------------------------------
 // Labels
 // -----------------------------------------------------------------------------
 // Written once here so the app, the notifications and any future PDF all say
@@ -128,5 +195,13 @@ module.exports = {
     OFFER_TIMEOUT_MINUTES,
     offerTimeoutFor,
     BOOKING_STATUS_LABELS,
-    BOOKING_TYPE_LABELS
+    BOOKING_TYPE_LABELS,
+
+    RATING_REASONS,
+    RATING_REASON_LABELS,
+    reasonsFor,
+    isValidReason,
+    RATING_WINDOW_DAYS,
+    MAX_RATING_REASONS,
+    MAX_RATING_COMMENT
 };

@@ -74,6 +74,11 @@ const getAvailableDrivers = async (req, res) => {
         const result = await pool.query(
             `SELECT u.id, u.first_name, u.last_name, u.email, u.phone,
                     u.is_online, u.last_online_at,
+                    -- Read from the columns rather than counted here. With a
+                    -- hundred drivers on this screen, one COUNT per driver per
+                    -- request is the query that makes the assignment screen
+                    -- unusable once the firm grows. See migration 016.
+                    u.rating_average, u.rating_count, u.completed_trips,
                     v.id AS vehicle_id, v.registration_number, v.make, v.model,
                     v.vehicle_class, v.owner_type,
                     (cf.driver_id IS NOT NULL)  AS is_fleet,
@@ -95,7 +100,17 @@ const getAvailableDrivers = async (req, res) => {
              LEFT JOIN operator_favourite_drivers fav
                ON fav.driver_id = u.id AND fav.operator_id = ${operatorParam}
              WHERE ${where.join(" AND ")}
-             ORDER BY u.is_online DESC, u.first_name ASC
+             -- Online first, then favourites, then the best rated. An operator
+             -- scanning this list top to bottom should meet the driver they
+             -- would have rung first anyway.
+             --
+             -- NULLS LAST matters: a driver with no ratings yet sorts below
+             -- rated drivers rather than above them, which is what a bare
+             -- DESC would do.
+             ORDER BY u.is_online DESC,
+                      (fav.driver_id IS NOT NULL) DESC,
+                      u.rating_average DESC NULLS LAST,
+                      u.first_name ASC
              LIMIT 100`,
             params
         );
@@ -129,6 +144,14 @@ const getAvailableDrivers = async (req, res) => {
                 is_favourite: d.is_favourite,
                 active_jobs: d.active_jobs,
                 trips_today: d.trips_today,
+
+                // NULL, not 0, for a driver nobody has rated yet — so the app
+                // can show "New" instead of what looks like a zero-star
+                // driver. Converted from pg's NUMERIC string so the app is
+                // not handed "4.20" to do arithmetic on.
+                rating_average: d.rating_average === null ? null : Number(d.rating_average),
+                rating_count: d.rating_count,
+                completed_trips: d.completed_trips,
 
                 vehicle: {
                     id: d.vehicle_id,

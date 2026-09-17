@@ -5,7 +5,8 @@ const { DRIVER_STATUS_STEPS } = require("../constants/bookings");
 const {
     notifyOfferAccepted,
     notifyOfferDeclined,
-    notifyJobStatusChanged
+    notifyJobStatusChanged,
+    notifyRatingDue
 } = require("../services/appNotifications");
 
 // Everything the driver's app does with work: go online, see what has been
@@ -490,9 +491,23 @@ const updateJobStatus = async (req, res) => {
         // sent yet; when it is, it goes here, and a failure to send must never
         // stop the driver's status changing.
 
+        // The job is over — ask both sides to rate it.
+        //
+        // Once, here, and never again. A reminder that repeats collects
+        // ratings given to stop the reminder, and those are worth less than no
+        // rating at all.
+        if (result.completed) {
+            notifyRatingDue(result.booking.operator_id, Number(id), result.booking.reference);
+            notifyRatingDue(req.user.id, Number(id), result.booking.reference);
+        }
+
         res.status(200).json({
             message: "Status updated",
-            booking: toBooking(booking.rows[0])
+            booking: toBooking(booking.rows[0]),
+
+            // So the app can put the rating form straight in front of the
+            // driver instead of making them find the finished job again.
+            ...(result.completed ? { rating_due: true } : {})
         });
 
     } catch (error) {
