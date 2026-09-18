@@ -10,7 +10,9 @@ const {
     otpMatches,
     otpExpiryDate,
     secondsSince,
-    shouldExposeOtp
+    shouldExposeOtp,
+    isTestIdentifier,
+    getTestOtp
 } = require("../utils/otp");
 
 // LOGIN, not sign-up.
@@ -145,12 +147,27 @@ const sendLoginCode = async (req, res, type) => {
             });
         }
 
+        // Is this one of the listed test accounts?
+        //
+        // Never for an admin, whatever the list says. An admin can open every
+        // driver's passport, so the one account that must never have a
+        // guessable code is theirs — and the cost of this line is nothing.
+        //
+        // The list is empty unless TWO environment variables are set, and they
+        // are never set on the live deployment. See utils/otp.js.
+        const isTestAccount =
+            isTestIdentifier(identifier) && user.role !== "admin";
+
         const live = await findLiveCode(identifier, type);
 
         if (live) {
             const waited = secondsSince(live.created_at);
 
-            if (waited < RESEND_COOLDOWN_SECONDS) {
+            // The one-minute wait between codes is there to stop somebody
+            // hammering the SMS bill. A test account sends no message and
+            // costs nothing, and the person using it is asking for a code
+            // every thirty seconds while they build a screen.
+            if (!isTestAccount && waited < RESEND_COOLDOWN_SECONDS) {
                 return res.status(429).json({
                     message: "A code was just sent. Please wait before requesting another.",
                     retry_after_seconds: RESEND_COOLDOWN_SECONDS - waited
@@ -164,7 +181,13 @@ const sendLoginCode = async (req, res, type) => {
             );
         }
 
-        const otp = generateOtp();
+        // The ONLY difference for a test account: the digits are known in
+        // advance. Everything below is the ordinary path — the code is hashed
+        // the same way, expires in the same five minutes, can be spent once,
+        // and allows the same five attempts. Nothing about verification knows
+        // or cares that this was a test account, which is exactly why this
+        // change is safe: there is no second way in, only a predictable code.
+        const otp = isTestAccount ? getTestOtp() : generateOtp();
 
         await pool.query(
             `INSERT INTO otp_codes (identifier, otp_hash, otp_type, expires_at)
@@ -172,15 +195,27 @@ const sendLoginCode = async (req, res, type) => {
             [identifier, hashOtp(otp), type, otpExpiryDate()]
         );
 
-        if (isPhone) {
-            await notify.sendSmsOtp(identifier, otp);
-        } else {
-            await notify.sendEmailOtp(identifier, otp);
+        // Nothing is sent for a test account. The number belongs to nobody, and
+        // once this goes through a real provider a message to a made-up number
+        // is a failed send and a charge. The code is in the database either
+        // way, which is all that matters.
+        if (!isTestAccount) {
+            if (isPhone) {
+                await notify.sendSmsOtp(identifier, otp);
+            } else {
+                await notify.sendEmailOtp(identifier, otp);
+            }
         }
 
         res.status(200).json({
             message: `If an account exists, a verification code has been sent to your ${field}`,
             expires_in_minutes: OTP_TTL_MINUTES,
+
+            // Said out loud so nobody sits waiting for a text that is never
+            // coming, and so it is obvious in a screenshot that this was a
+            // test account rather than a real login.
+            ...(isTestAccount ? { test_account: true } : {}),
+
             ...(shouldExposeOtp() ? { dev_otp: otp } : {})
         });
 

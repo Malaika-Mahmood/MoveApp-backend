@@ -53,6 +53,79 @@ const secondsSince = (date) =>
 // switched on for local development. It must be false in production.
 const shouldExposeOtp = () => process.env.EXPOSE_DEV_OTP === "true";
 
+// ---------------------------------------------------------------------------
+// Test accounts
+// ---------------------------------------------------------------------------
+// A small, named list of numbers whose code is always the same, so the app can
+// be developed without waiting for a text message.
+//
+// This is the dangerous part of the file, so it is written to be difficult to
+// switch on by accident:
+//
+//   1. It needs TWO environment variables, not one. Neither on its own does
+//      anything. A stray variable copied to production is inert.
+//   2. It applies only to numbers listed by hand. It is not "all numbers" with
+//      an exception list — it is nothing, with an inclusion list.
+//   3. The code must be the right length and all digits, or the whole thing
+//      stays off and says so at startup.
+//   4. It shouts at startup, every time. A server log that says TEST OTP
+//      ENABLED is hard to leave running by mistake.
+//
+// The controller adds one more rule: it never applies to an admin.
+//
+// Everything else stays exactly as it is — the code is still hashed, still
+// expires in five minutes, still single use, still limited to five attempts.
+// The ONLY difference is that the digits are predictable for these numbers.
+// That keeps this change small, which is the point: nothing about the login
+// path behaves differently, so nothing else can break.
+//
+// NEVER set these two on the live deployment.
+
+const TEST_OTP_VALUE = String(process.env.TEST_OTP || "").trim();
+
+const TEST_IDENTIFIERS = String(process.env.TEST_PHONE_NUMBERS || "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+// Numbers get typed a dozen ways — +447700900099, 07700 900099, 44 7700
+// 900099. Comparing the digits alone means the list works however it is
+// written, in the variable and in the request.
+const digitsOnly = (value) => String(value).replace(/\D/g, "");
+
+const TEST_OTP_IS_VALID =
+    TEST_OTP_VALUE.length === OTP_LENGTH && /^\d+$/.test(TEST_OTP_VALUE);
+
+const testAccountsEnabled = () =>
+    TEST_OTP_IS_VALID && TEST_IDENTIFIERS.length > 0;
+
+const isTestIdentifier = (identifier) => {
+    if (!testAccountsEnabled()) return false;
+
+    const wanted = digitsOnly(identifier);
+    if (!wanted) return false;
+
+    return TEST_IDENTIFIERS.some(
+        (entry) => entry === identifier || digitsOnly(entry) === wanted
+    );
+};
+
+const getTestOtp = () => TEST_OTP_VALUE;
+
+// Said once, at startup, loudly.
+if (TEST_OTP_VALUE && !TEST_OTP_IS_VALID) {
+    console.warn(
+        `TEST_OTP is set but is not ${OTP_LENGTH} digits — test accounts are OFF.`
+    );
+} else if (TEST_OTP_VALUE && TEST_IDENTIFIERS.length === 0) {
+    console.warn("TEST_OTP is set but TEST_PHONE_NUMBERS is empty — test accounts are OFF.");
+} else if (testAccountsEnabled()) {
+    console.warn("=================================================================");
+    console.warn(`TEST OTP ENABLED for ${TEST_IDENTIFIERS.length} number(s).`);
+    console.warn("These accounts accept one fixed code. NEVER enable this on live.");
+    console.warn("=================================================================");
+}
+
 module.exports = {
     OTP_LENGTH,
     OTP_TTL_MINUTES,
@@ -64,5 +137,9 @@ module.exports = {
     otpMatches,
     otpExpiryDate,
     secondsSince,
-    shouldExposeOtp
+    shouldExposeOtp,
+
+    testAccountsEnabled,
+    isTestIdentifier,
+    getTestOtp
 };
