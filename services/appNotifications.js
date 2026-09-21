@@ -312,6 +312,71 @@ const notifyRatingDue = (userId, bookingId, reference) =>
         })
     );
 
+// -----------------------------------------------------------------------------
+// Bidding
+// -----------------------------------------------------------------------------
+
+// A driver has put their hand up for an open job.
+//
+// The amount is in the title because that is the whole message. An operator
+// glancing at their phone wants to know whether it is worth opening the app,
+// and "Faris Khan bid 95" answers that; "you have a new bid" does not.
+const notifyBidReceived = (operatorId, bookingId, reference, driverName, amount) =>
+    safely("bid_received", async () =>
+        create({
+            userId: operatorId,
+            type: NOTIFICATION_TYPES.BID_RECEIVED,
+            title: amount === null || amount === undefined
+                ? `${driverName} will take job ${reference}`
+                : `${driverName} bid ${amount} on job ${reference}`,
+            body: null,
+            data: { booking_id: bookingId, reference, amount }
+        })
+    );
+
+// The driver got the job.
+const notifyBidAccepted = (driverId, bookingId, reference, amount) =>
+    safely("bid_accepted", async () =>
+        create({
+            userId: driverId,
+            type: NOTIFICATION_TYPES.BID_ACCEPTED,
+            title: `Job ${reference} is yours`,
+            body: amount === null || amount === undefined
+                ? "The operator has assigned it to you."
+                : `Agreed at ${amount}.`,
+            data: { booking_id: bookingId, reference, amount }
+        })
+    );
+
+// The operator said no to this bid — but not to this driver.
+//
+// The wording matters. The job is still open and they may bid again, which is
+// usually what the operator wants: "too expensive" is the commonest reason to
+// reject, and a driver who thinks the door is shut does not come back with a
+// lower number.
+const notifyBidRejected = (driverId, bookingId, reference) =>
+    safely("bid_rejected", async () =>
+        create({
+            userId: driverId,
+            type: NOTIFICATION_TYPES.BID_REJECTED,
+            title: `Your bid on ${reference} was not accepted`,
+            body: "The job is still open — you can bid again.",
+            data: { booking_id: bookingId, reference, can_bid_again: true }
+        })
+    );
+
+// Somebody else got it. Nothing to do, nothing to come back to.
+const notifyBidLost = (driverId, bookingId, reference) =>
+    safely("bid_lost", async () =>
+        create({
+            userId: driverId,
+            type: NOTIFICATION_TYPES.BID_LOST,
+            title: `Job ${reference} has gone to another driver`,
+            body: null,
+            data: { booking_id: bookingId, reference }
+        })
+    );
+
 module.exports = {
     create,
     notifyJobOffered,
@@ -328,5 +393,10 @@ module.exports = {
     notifyAccessRequest,
     notifyAccessDecision,
     notifyRatingReceived,
-    notifyRatingDue
+    notifyRatingDue,
+
+    notifyBidReceived,
+    notifyBidAccepted,
+    notifyBidRejected,
+    notifyBidLost
 };

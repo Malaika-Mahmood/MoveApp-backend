@@ -11,7 +11,8 @@ const {
     notifyOfferAccepted,
     notifyOfferDeclined,
     notifyJobStatusChanged,
-    notifyRatingDue
+    notifyRatingDue,
+    notifyBidReceived
 } = require("../services/appNotifications");
 
 // Everything the driver's app does with work: go online, see what has been
@@ -113,10 +114,8 @@ const listMyOffers = async (req, res) => {
                 offered_at: row.offered_at,
                 expires_at: row.expires_at,
 
-                // The client's number is withheld until the driver accepts.
-                // They can see where the job goes and when — everything they
-                // need to decide — but not a phone number for a job they have
-                // not taken.
+                // The client's number is never sent to a driver — not here,
+                // not after they accept. See the note on toBooking.
                 booking: toBooking(row, { includeClientContact: false })
             })),
             pending_count: result.rows.length
@@ -192,9 +191,9 @@ const respondToOffer = async (req, res) => {
 
         res.status(200).json({
             message: decision === "accepted" ? "Job accepted" : "Job declined",
-            // Accepting is what unlocks the client's number — the driver now
-            // has a reason to ring them.
-            booking: toBooking(booking.rows[0], { includeClientContact: decision === "accepted" })
+            // Still no client number, even now. Accepting a job does not
+            // create a right to ring the passenger; the office handles that.
+            booking: toBooking(booking.rows[0], { includeClientContact: false })
         });
 
     } catch (error) {
@@ -289,7 +288,19 @@ const listAvailableJobs = async (req, res) => {
 // -----------------------------------------------------------------------------
 // POST /api/v1/drivers/me/available-jobs/:id/claim
 // -----------------------------------------------------------------------------
-const claimJob = async (req, res) => {
+// -----------------------------------------------------------------------------
+// POST /api/v1/drivers/me/available-jobs/:id/bid   { "amount": 95 }
+// -----------------------------------------------------------------------------
+// This replaced the Claim button on 21 September, and the difference is the
+// whole point: a bid does NOT give the driver the job. It tells the operator
+// they are willing, at a price where there is one, and the operator decides.
+//
+// Bidding again on the same job replaces the amount rather than adding a
+// second bid, so this is also how a driver changes their mind.
+//
+// On a fixed-fare job there is nothing to name — send no amount, and it means
+// "I will take it at your price".
+const placeBid = async (req, res) => {
     try {
         const { id } = req.params;
         if (!/^\d+$/.test(id)) {
@@ -297,58 +308,158 @@ const claimJob = async (req, res) => {
         }
 
         // Checked here, before the service. Without it an operator calling this
-        // endpoint fell through to "That driver does not exist" — which is true
-        // in the narrow sense and useless to read, because the person asking is
-        // logged in and knows they exist.
+        // endpoint fell through to "That driver does not exist" — true in the
+        // narrow sense and useless to read, because the person asking is logged
+        // in and knows they exist.
         if (req.user.role !== "driver") {
             return res.status(403).json({
-                message: "Only drivers can take jobs",
+                message: "Only drivers can bid on jobs",
                 error_code: "FORBIDDEN"
             });
         }
 
         if (req.user.account_locked) {
             return res.status(403).json({
-                message: "Upload your replacement document before taking jobs",
+                message: "Upload your replacement document before bidding",
                 error_code: "ACCOUNT_LOCKED"
             });
         }
 
-        const { vehicle_id } = req.body || {};
+        const { amount } = req.body || {};
 
-        const result = await offers.claimOpenJob(
+        const result = await offers.placeBid(
             req.user.id,
             Number(id),
-            vehicle_id ? Number(vehicle_id) : null
+            amount === undefined ? null : amount
         );
 
         if (result.error) {
-            const status = result.error === "NOT_FOUND" ? 404 : 409;
-            return res.status(status).json({ message: result.message, error_code: result.error });
+            const status = result.error === "NOT_FOUND" ? 404
+                : result.error === "DRIVER_UNAVAILABLE" ? 409
+                    : result.error === "JOB_TAKEN" ? 409
+                        : 400;
+
+            return res.status(status).json({
+                message: result.message,
+                error_code: result.error
+            });
         }
 
-        const booking = await pool.query(
-            `SELECT ${BOOKING_SELECT} ${BOOKING_JOINS} WHERE b.id = $1`,
-            [result.booking_id]
+        const driverName = [req.user.first_name, req.user.last_name].filter(Boolean).join(" ");
+
+        notifyBidReceived(
+            result.operator_id,
+            result.booking_id,
+            result.reference,
+            driverName,
+            result.bid.amount === null ? null : Number(result.bid.amount)
         );
 
-        const driverName = [req.user.first_name, req.user.last_name].filter(Boolean).join(" ");
-        notifyOfferAccepted(booking.rows[0].created_by_operator_id, result.booking_id, driverName);
-
-        res.status(200).json({
-            message: "Job is yours",
-            booking: toBooking(booking.rows[0])
+        res.status(201).json({
+            message: "Your bid is with the operator",
+            bid: {
+                id: result.bid.id,
+                booking_id: result.booking_id,
+                reference: result.reference,
+                amount: result.bid.amount === null ? null : Number(result.bid.amount),
+                status: result.bid.status,
+                offered_at: result.bid.offered_at
+            }
         });
 
     } catch (error) {
-        console.error("Error in claimJob:", error);
-        res.status(500).json({ message: "Something went wrong while taking the job" });
+        console.error("Error in placeBid:", error);
+        res.status(500).json({ message: "Something went wrong while placing your bid" });
     }
 };
 
 // -----------------------------------------------------------------------------
-// GET /api/v1/drivers/me/jobs?scope=upcoming|today|past|active
+// DELETE /api/v1/drivers/me/bids/:id
 // -----------------------------------------------------------------------------
+// Taking a bid back, before the operator has chosen.
+const withdrawBid = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!/^\d+$/.test(id)) {
+            return res.status(400).json({ message: "Invalid bid id" });
+        }
+
+        if (req.user.role !== "driver") {
+            return res.status(403).json({ message: "Drivers only", error_code: "FORBIDDEN" });
+        }
+
+        const withdrawn = await offers.withdrawBid(req.user.id, Number(id));
+
+        if (!withdrawn) {
+            // One message for "not yours", "already answered" and "never
+            // existed". Telling a driver that somebody else's bid exists is a
+            // small leak with no upside.
+            return res.status(409).json({
+                message: "That bid is no longer live",
+                error_code: "BID_NOT_LIVE"
+            });
+        }
+
+        res.status(200).json({
+            message: "Bid withdrawn",
+            booking_id: withdrawn.booking_id
+        });
+
+    } catch (error) {
+        console.error("Error in withdrawBid:", error);
+        res.status(500).json({ message: "Something went wrong" });
+    }
+};
+
+// -----------------------------------------------------------------------------
+// GET /api/v1/drivers/me/bids
+// -----------------------------------------------------------------------------
+// "View My Bids" on the driver's screen. Live ones first — those are the only
+// ones they can still do anything about.
+const listMyBids = async (req, res) => {
+    try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({ message: "Drivers only", error_code: "FORBIDDEN" });
+        }
+
+        const result = await pool.query(
+            `SELECT o.id, o.amount, o.status, o.offered_at, o.responded_at,
+                    ${BOOKING_SELECT}
+             FROM booking_offers o
+             JOIN bookings b      ON b.id = o.booking_id
+             LEFT JOIN users d    ON d.id = b.driver_id
+             LEFT JOIN vehicles v ON v.id = b.vehicle_id
+             WHERE o.driver_id = $1 AND o.offer_kind = 'bid'
+             ORDER BY (o.status = 'pending') DESC, o.offered_at DESC
+             LIMIT 50`,
+            [req.user.id]
+        );
+
+        res.status(200).json({
+            bids: result.rows.map((row) => ({
+                id: row.id,
+                amount: row.amount === null ? null : Number(row.amount),
+                status: row.status,
+                offered_at: row.offered_at,
+                responded_at: row.responded_at,
+
+                // A rejected bid can be replaced with another one; a lost job
+                // cannot. Said plainly so the app does not have to work out
+                // which button to show from the status word.
+                can_bid_again: row.status === "rejected",
+
+                booking: toBooking(row, { includeClientContact: false })
+            })),
+
+            live_count: result.rows.filter((r) => r.status === "pending").length
+        });
+
+    } catch (error) {
+        console.error("Error in listMyBids:", error);
+        res.status(500).json({ message: "Something went wrong while fetching your bids" });
+    }
+};
+
 const listMyJobs = async (req, res) => {
     try {
         if (req.user.role !== "driver") {
@@ -386,7 +497,7 @@ const listMyJobs = async (req, res) => {
 
         res.status(200).json({
             scope,
-            jobs: result.rows.map((b) => toBooking(b)),
+            jobs: result.rows.map((b) => toBooking(b, { includeClientContact: false })),
             total: result.rows.length
         });
 
@@ -421,7 +532,7 @@ const getMyJob = async (req, res) => {
             return res.status(404).json({ message: "No job with that id", error_code: "NOT_FOUND" });
         }
 
-        const shaped = toBooking(booking);
+        const shaped = toBooking(booking, { includeClientContact: false });
 
         // The driver is told who they are working for — name and company, no
         // number. That is not a break in the masking rule: masking was always
@@ -512,7 +623,7 @@ const updateJobStatus = async (req, res) => {
 
         res.status(200).json({
             message: "Status updated",
-            booking: toBooking(booking.rows[0]),
+            booking: toBooking(booking.rows[0], { includeClientContact: false }),
 
             // So the app can put the rating form straight in front of the
             // driver instead of making them find the finished job again.
@@ -530,7 +641,9 @@ module.exports = {
     listMyOffers,
     respondToOffer,
     listAvailableJobs,
-    claimJob,
+    placeBid,
+    withdrawBid,
+    listMyBids,
     listMyJobs,
     getMyJob,
     updateJobStatus

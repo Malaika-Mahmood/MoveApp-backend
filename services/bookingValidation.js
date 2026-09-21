@@ -356,6 +356,11 @@ const capacityKnown = (vehicle) =>
 // Shaping
 // -----------------------------------------------------------------------------
 
+// pg returns NUMERIC as a string — deliberately, so it never silently loses
+// precision on a value JavaScript cannot hold. Money is small enough here that
+// a number is safe, and an app handed "95.00" to add up gets a surprise.
+const num = (value) => (value === null || value === undefined ? null : Number(value));
+
 // One shape for every endpoint that returns a booking, so the app never has to
 // handle two versions of the same thing.
 const toBooking = (b, { includeClientContact = true } = {}) => ({
@@ -370,9 +375,24 @@ const toBooking = (b, { includeClientContact = true } = {}) => ({
 
     client: {
         name: b.client_name,
-        // A driver who has not accepted yet does not get the client's number.
-        // They can see where the job goes and when; they cannot ring the
-        // client about a job they have not taken.
+
+        // A driver never gets the client's phone number or email. Not before
+        // accepting, not after, not on the job itself.
+        //
+        // Decided 21 September: the office handles everything between the
+        // passenger and the driver, in both directions. That is how Eurocars
+        // works today, and it is what protects both sides — the client's
+        // number does not end up in a stranger's phone, and the driver is not
+        // taking calls about a job the office knows nothing about.
+        //
+        // Every driver-facing endpoint therefore passes includeClientContact
+        // false. The flag stays because the operator and the admin do see
+        // these fields, and they are the ones who ring people.
+        //
+        // The practical cost is real: at an airport a driver often needs to
+        // reach the passenger. Until masked calling is built, that goes
+        // through the operator — which is why "Contact Operator" needs to be
+        // easy to find on the driver's trip screen.
         phone: includeClientContact ? b.client_phone : null,
         email: includeClientContact ? b.client_email : null,
         contact_masked: !includeClientContact
@@ -455,9 +475,39 @@ const toBooking = (b, { includeClientContact = true } = {}) => ({
         ? { reason: b.cancellation_reason, cancelled_by: b.cancelled_by, at: b.cancelled_at }
         : null,
 
-    // Reserved — see migration 013. Always null until fare work is done.
+    // How this job is priced, and what it settled at.
+    //
+    // Deliberately not named for whose money it is. The operator calls the
+    // amount the driver's earning; the designer's screens show a payment
+    // method and a total, which are client-side things. That question is open
+    // and the CEO's payments brief will answer it — see migration 019.
+    //
+    // NUMERIC comes back from pg as a string, because it will not silently
+    // lose precision. Converted here so the app is not handed "95.00" to do
+    // arithmetic on.
+    pricing: {
+        mode: b.fare_mode || "fixed",
+
+        // Set when mode is 'fixed'. May be null — the operator interview was
+        // clear that jobs are sometimes given out with no amount at all.
+        fixed_amount: num(b.fixed_amount),
+
+        // Set when mode is 'bidding'. The window a driver must bid inside.
+        bid_low: num(b.bid_low),
+        bid_high: num(b.bid_high),
+
+        // What it was agreed at, once a driver has it. Copied from the
+        // accepted bid rather than read back through it, so editing that row
+        // later cannot change what the job was done for.
+        agreed_amount: num(b.agreed_amount),
+
+        currency: b.fare_currency || "GBP"
+    },
+
+    // Reserved — see migration 013. The client-side total, still untouched
+    // until the payments work.
     fare: {
-        total: b.fare_total,
+        total: num(b.fare_total),
         currency: b.fare_currency,
         payment_method: b.payment_method
     }

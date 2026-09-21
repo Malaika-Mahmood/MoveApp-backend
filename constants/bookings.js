@@ -69,14 +69,76 @@ const DRIVER_STATUS_STEPS = {
 };
 
 // -----------------------------------------------------------------------------
-// Offers
+// Offers and bids
 // -----------------------------------------------------------------------------
+// Two ways a driver ends up connected to a booking, sharing one table because
+// they share one life — see migration 019.
+//
+//   direct  the operator put the job to one named driver
+//   bid     the driver put their hand up for an open job
+const OFFER_KIND = {
+    DIRECT: "direct",
+    BID: "bid"
+};
+
 const OFFER_STATUS = {
     PENDING: "pending",
     ACCEPTED: "accepted",
+
+    // The DRIVER said no. Only a direct offer can be declined — nobody
+    // declines a job they were never given.
     DECLINED: "declined",
+
+    // The OPERATOR said no to this bid. Different from declined, and kept
+    // apart on purpose: "the driver turned us down" and "we turned the driver
+    // down" are not the same fact, and one day somebody will count them.
+    REJECTED: "rejected",
+
+    // The job went to somebody else. Not a judgement on this driver — they
+    // were simply not the one chosen — which is why it is not 'rejected'.
+    LOST: "lost",
+
     EXPIRED: "expired",
+
+    // A direct offer taken back by the operator, or a bid taken back by the
+    // driver. Same word because it is the same act: whoever made it, unmade it.
     WITHDRAWN: "withdrawn"
+};
+
+// -----------------------------------------------------------------------------
+// How a booking is priced
+// -----------------------------------------------------------------------------
+// FIXED    the operator names one amount
+// BIDDING  the operator names a range and drivers say what they will take
+//
+// Whose money this is has not been decided — the operator calls it the
+// driver's earning, the designer's screens show client-side payment. See the
+// note at the top of migration 019.
+const FARE_MODE = {
+    FIXED: "fixed",
+    BIDDING: "bidding"
+};
+
+const ALL_FARE_MODES = Object.values(FARE_MODE);
+
+// Amounts are held to two decimal places and cannot be negative. The ceiling
+// is not a business rule, it is a typo catch: a £900,000 airport transfer is
+// somebody's finger slipping, and it is better refused at the door than
+// discovered on an invoice.
+const MAX_AMOUNT = 100000;
+
+const isValidAmount = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 && n <= MAX_AMOUNT;
+};
+
+// Money as a number the database will accept, or null. Rounded rather than
+// truncated — £10.005 becoming £10.00 loses somebody a penny every time, and
+// pennies are what people notice.
+const toAmount = (value) => {
+    if (value === undefined || value === null || value === "") return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
 };
 
 // How long a driver has to answer.
@@ -192,8 +254,15 @@ module.exports = {
     canTransition,
     DRIVER_STATUS_STEPS,
     OFFER_STATUS,
+    OFFER_KIND,
     OFFER_TIMEOUT_MINUTES,
     offerTimeoutFor,
+
+    FARE_MODE,
+    ALL_FARE_MODES,
+    MAX_AMOUNT,
+    isValidAmount,
+    toAmount,
     BOOKING_STATUS_LABELS,
     BOOKING_TYPE_LABELS,
 

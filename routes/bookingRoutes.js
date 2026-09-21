@@ -14,7 +14,10 @@ const {
     offerBooking,
     withdrawBookingOffer,
     publishBooking,
-    unpublishBooking
+    unpublishBooking,
+    getBids,
+    acceptBid,
+    rejectBid
 } = require("../controllers/bookingAssignmentController");
 
 const authenticate = require("../middleware/authenticate");
@@ -51,6 +54,15 @@ router.delete("/:id/offer", withdrawBookingOffer);
 
 router.post("/:id/publish", publishBooking);
 router.delete("/:id/publish", unpublishBooking);
+
+// Bids. The list, and the two decisions.
+//
+// Accepting is what actually assigns the job — a driver bidding does not win
+// it. Rejecting closes one bid and leaves the job open, so that driver can
+// come back with a different number.
+router.get("/:id/bids", getBids);
+router.post("/:id/bids/:bidId/accept", acceptBid);
+router.post("/:id/bids/:bidId/reject", rejectBid);
 
 router.get("/:id", getBooking);
 router.patch("/:id", updateBooking);

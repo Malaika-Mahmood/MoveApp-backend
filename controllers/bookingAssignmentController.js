@@ -9,9 +9,18 @@ const {
 } = require("../services/bookingValidation");
 const { maskDriverContact } = require("../utils/masking");
 const {
+    FARE_MODE,
+    ALL_FARE_MODES,
+    isValidAmount,
+    toAmount
+} = require("../constants/bookings");
+const {
     notifyJobOffered,
     notifyOfferWithdrawn,
-    notifyJobPublished
+    notifyJobPublished,
+    notifyBidAccepted,
+    notifyBidRejected,
+    notifyBidLost
 } = require("../services/appNotifications");
 
 // The operator's side of getting a booking to a driver: who is available,
@@ -302,7 +311,14 @@ const withdrawBookingOffer = async (req, res) => {
 // -----------------------------------------------------------------------------
 // "Skip — Save as Unassigned" on the designer's screen. The job goes into the
 // open pool, where any driver whose car actually holds the passengers and the
-// luggage can take it.
+// luggage can bid for it.
+//
+// The body carries what the operator typed on the Fare Details screen, and is
+// optional — a job republished after being pulled back keeps the pricing it
+// already had:
+//
+//   { "fare_mode": "fixed",   "amount": 100 }
+//   { "fare_mode": "bidding", "bid_low": 85, "bid_high": 110 }
 const publishBooking = async (req, res) => {
     try {
         const { id } = req.params;
@@ -310,7 +326,62 @@ const publishBooking = async (req, res) => {
             return res.status(400).json({ message: "Invalid booking id" });
         }
 
-        const published = await offers.publishToPool(Number(id));
+        const body = req.body || {};
+        let pricing = null;
+
+        if (body.fare_mode !== undefined) {
+            if (!ALL_FARE_MODES.includes(body.fare_mode)) {
+                return res.status(400).json({
+                    message: `fare_mode must be one of: ${ALL_FARE_MODES.join(", ")}`,
+                    error_code: "INVALID_FARE_MODE"
+                });
+            }
+
+            if (body.fare_mode === FARE_MODE.BIDDING) {
+                const low = toAmount(body.bid_low);
+                const high = toAmount(body.bid_high);
+
+                if (low === null || high === null) {
+                    return res.status(400).json({
+                        message: "A bidding job needs both bid_low and bid_high",
+                        error_code: "RANGE_REQUIRED"
+                    });
+                }
+
+                if (!isValidAmount(low) || !isValidAmount(high)) {
+                    return res.status(400).json({
+                        message: "Those are not valid amounts",
+                        error_code: "INVALID_AMOUNT"
+                    });
+                }
+
+                if (low > high) {
+                    return res.status(400).json({
+                        message: "The lowest bid cannot be above the highest",
+                        error_code: "RANGE_BACKWARDS"
+                    });
+                }
+
+                pricing = { mode: FARE_MODE.BIDDING, low, high };
+
+            } else {
+                const amount = toAmount(body.amount);
+
+                // A fixed-fare job with no amount is allowed. The operator
+                // interview was explicit: jobs are sometimes handed out with
+                // no number attached and sorted out afterwards.
+                if (amount !== null && !isValidAmount(amount)) {
+                    return res.status(400).json({
+                        message: "That is not a valid amount",
+                        error_code: "INVALID_AMOUNT"
+                    });
+                }
+
+                pricing = { mode: FARE_MODE.FIXED, amount };
+            }
+        }
+
+        const published = await offers.publishToPool(Number(id), pricing);
 
         if (!published) {
             return res.status(409).json({
@@ -350,7 +421,9 @@ const publishBooking = async (req, res) => {
         }
 
         res.status(200).json({
-            message: "Booking published to available drivers",
+            message: booking.fare_mode === FARE_MODE.BIDDING
+                ? "Booking opened for bids"
+                : "Booking published to available drivers",
             booking: toBooking(booking),
             notified_drivers: eligible.rows.length
         });
@@ -385,10 +458,203 @@ const unpublishBooking = async (req, res) => {
     }
 };
 
+
+// -----------------------------------------------------------------------------
+// GET /api/v1/operator/bookings/:id/bids
+// -----------------------------------------------------------------------------
+// The screen headed "LOWEST BID (4)". Cheapest first, live bids above settled
+// ones, with everything the operator weighs against the number: rating, trips,
+// the car, whether they are one of ours, whether they are online.
+//
+// The cheapest bid is not automatically the right one, which is exactly why
+// this screen exists instead of the system deciding.
+const getBids = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!/^\d+$/.test(id)) {
+            return res.status(400).json({ message: "Invalid booking id" });
+        }
+
+        const booking = await loadBooking(Number(id));
+
+        if (!booking) {
+            return res.status(404).json({ message: "Booking not found", error_code: "NOT_FOUND" });
+        }
+
+        const rows = await offers.listBids(Number(id));
+
+        res.status(200).json({
+            booking: {
+                id: booking.id,
+                reference: booking.reference,
+                status: booking.status,
+                fare_mode: booking.fare_mode,
+                fixed_amount: booking.fixed_amount === null ? null : Number(booking.fixed_amount),
+                bid_low: booking.bid_low === null ? null : Number(booking.bid_low),
+                bid_high: booking.bid_high === null ? null : Number(booking.bid_high),
+                is_open_to_all: booking.is_open_to_all,
+                passengers: booking.passengers,
+                large_bags: booking.large_bags,
+                small_bags: booking.small_bags,
+                requested_vehicle: booking.requested_vehicle || null
+            },
+
+            bids: rows.map((b) => ({
+                id: b.id,
+                status: b.status,
+
+                // Null on a fixed-fare job: the driver accepted the operator's
+                // own number, so there is nothing of theirs to show.
+                amount: b.amount === null ? null : Number(b.amount),
+
+                offered_at: b.offered_at,
+                responded_at: b.responded_at,
+
+                driver: {
+                    ...maskDriverContact({
+                        id: b.driver_id,
+                        first_name: b.first_name,
+                        last_name: b.last_name,
+                        full_name: [b.first_name, b.last_name].filter(Boolean).join(" "),
+                        email: null,
+                        phone: null
+                    }, req.user.role),
+
+                    is_online: b.is_online,
+                    is_fleet: b.is_fleet,
+                    rating_average: b.rating_average === null ? null : Number(b.rating_average),
+                    rating_count: b.rating_count,
+                    completed_trips: b.completed_trips
+                },
+
+                vehicle: b.vehicle_id
+                    ? {
+                        id: b.vehicle_id,
+                        registration_number: b.registration_number,
+                        make: b.make,
+                        model: b.model,
+                        seats: b.seats,
+                        luggage_large: b.luggage_large,
+                        luggage_small: b.luggage_small,
+                        capacity_known: capacityKnown(b)
+                    }
+                    : null
+            })),
+
+            // Counted here so the screen's heading does not have to filter the
+            // list itself and get a different answer.
+            live_count: rows.filter((b) => b.status === "pending").length,
+            total: rows.length
+        });
+
+    } catch (error) {
+        console.error("Error in getBids:", error);
+        res.status(500).json({ message: "Something went wrong while fetching bids" });
+    }
+};
+
+// -----------------------------------------------------------------------------
+// POST /api/v1/operator/bookings/:id/bids/:bidId/accept
+// -----------------------------------------------------------------------------
+// The decision. The booking becomes that driver's, every other live bid is
+// closed, and the job leaves the pool — all in one transaction, because half
+// of that landing would leave two drivers each believing the job is theirs.
+const acceptBid = async (req, res) => {
+    try {
+        const { id, bidId } = req.params;
+
+        if (!/^\d+$/.test(id) || !/^\d+$/.test(bidId)) {
+            return res.status(400).json({ message: "Invalid id" });
+        }
+
+        const result = await offers.acceptBid(Number(id), Number(bidId));
+
+        if (result.error) {
+            const status =
+                result.error === "NOT_FOUND" ? 404
+                    : 409;
+
+            return res.status(status).json({
+                message: result.message,
+                error_code: result.error,
+                ...(result.current_status ? { current_status: result.current_status } : {}),
+                ...(result.bid_status ? { bid_status: result.bid_status } : {})
+            });
+        }
+
+        notifyBidAccepted(result.driver_id, result.booking_id, result.reference, result.amount);
+
+        // Everybody who did not get it is told in the same breath, so nobody
+        // is left watching a bid that will never be answered.
+        for (const driverId of result.lost_driver_ids) {
+            notifyBidLost(driverId, result.booking_id, result.reference);
+        }
+
+        const booking = await loadBooking(Number(id));
+
+        res.status(200).json({
+            message: "Job assigned",
+            booking: toBooking(booking),
+            agreed_amount: result.amount === null ? null : Number(result.amount),
+            other_bids_closed: result.lost_driver_ids.length
+        });
+
+    } catch (error) {
+        console.error("Error in acceptBid:", error);
+        res.status(500).json({ message: "Something went wrong while assigning the job" });
+    }
+};
+
+// -----------------------------------------------------------------------------
+// POST /api/v1/operator/bookings/:id/bids/:bidId/reject
+// -----------------------------------------------------------------------------
+// No to this bid, not to this driver. The job stays open and they may come
+// back with a different number — which is usually the point, since the
+// commonest reason to reject is that the price is too high.
+const rejectBid = async (req, res) => {
+    try {
+        const { id, bidId } = req.params;
+
+        if (!/^\d+$/.test(id) || !/^\d+$/.test(bidId)) {
+            return res.status(400).json({ message: "Invalid id" });
+        }
+
+        const booking = await loadBooking(Number(id));
+
+        if (!booking) {
+            return res.status(404).json({ message: "Booking not found", error_code: "NOT_FOUND" });
+        }
+
+        const rejected = await offers.rejectBid(Number(id), Number(bidId));
+
+        if (!rejected) {
+            return res.status(409).json({
+                message: "That bid is no longer live",
+                error_code: "BID_NOT_LIVE"
+            });
+        }
+
+        notifyBidRejected(rejected.driver_id, Number(id), booking.reference);
+
+        res.status(200).json({
+            message: "Bid rejected. The job is still open.",
+            bid_id: Number(bidId)
+        });
+
+    } catch (error) {
+        console.error("Error in rejectBid:", error);
+        res.status(500).json({ message: "Something went wrong" });
+    }
+};
+
 module.exports = {
     getAvailableDrivers,
     offerBooking,
     withdrawBookingOffer,
     publishBooking,
-    unpublishBooking
+    unpublishBooking,
+
+    getBids,
+    acceptBid,
+    rejectBid
 };

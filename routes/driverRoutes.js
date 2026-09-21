@@ -20,7 +20,9 @@ const {
     listMyOffers,
     respondToOffer,
     listAvailableJobs,
-    claimJob,
+    placeBid,
+    withdrawBid,
+    listMyBids,
     listMyJobs,
     getMyJob,
     updateJobStatus
@@ -73,7 +75,17 @@ router.get("/me/offers", authenticate, listMyOffers);
 router.patch("/me/offers/:id", authenticate, respondToOffer);
 
 router.get("/me/available-jobs", authenticate, listAvailableJobs);
-router.post("/me/available-jobs/:id/claim", authenticate, claimJob);
+
+// Bidding replaced claiming on 21 September. A bid tells the operator the
+// driver is willing, at a price where there is one; it does not give them the
+// job. Only the operator assigns.
+//
+// The old POST .../claim is gone rather than kept as an alias — an endpoint
+// whose name promises the job and no longer delivers it is worse than a 404.
+router.post("/me/available-jobs/:id/bid", authenticate, placeBid);
+
+router.get("/me/bids", authenticate, listMyBids);
+router.delete("/me/bids/:id", authenticate, withdrawBid);
 
 router.get("/me/jobs", authenticate, listMyJobs);
 router.get("/me/jobs/:id", authenticate, getMyJob);

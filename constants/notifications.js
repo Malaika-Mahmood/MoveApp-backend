@@ -44,6 +44,18 @@ const NOTIFICATION_TYPES = {
     JOB_STATUS_CHANGED: "job_status_changed",
     JOB_CANCELLED: "job_cancelled",
 
+    // Bidding. A driver put their hand up for an open job; the operator
+    // accepted it, turned it down, or gave the job to somebody else.
+    //
+    // BID_REJECTED and BID_LOST are separate on purpose. "We said no to your
+    // price" invites the driver to come back with another one; "somebody else
+    // got it" does not. Telling a driver the wrong one of those wastes
+    // everybody's time.
+    BID_RECEIVED: "bid_received",
+    BID_ACCEPTED: "bid_accepted",
+    BID_REJECTED: "bid_rejected",
+    BID_LOST: "bid_lost",
+
     // Somebody rated you for a completed job. Goes to both sides — a driver
     // rated by an operator, and an operator rated by a driver.
     RATING_RECEIVED: "rating_received",
@@ -76,6 +88,11 @@ const CATEGORY_BY_TYPE = {
 
     // A rating is about a job, so it belongs in the Jobs tab rather than
     // System — that is where somebody will go looking for it.
+    bid_received: "jobs",
+    bid_accepted: "jobs",
+    bid_rejected: "jobs",
+    bid_lost: "jobs",
+
     rating_received: "jobs",
     rating_reminder: "jobs"
     // Everything else — documents, access requests, account changes — is
