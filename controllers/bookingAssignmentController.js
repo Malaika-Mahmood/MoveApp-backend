@@ -1,6 +1,12 @@
 const pool = require("../config/db");
 const offers = require("../services/bookingOffers");
-const { toBooking, BOOKING_SELECT, BOOKING_JOINS } = require("../services/bookingValidation");
+const {
+    toBooking,
+    BOOKING_SELECT,
+    BOOKING_JOINS,
+    vehicleFits,
+    capacityKnown
+} = require("../services/bookingValidation");
 const { maskDriverContact } = require("../utils/masking");
 const {
     notifyJobOffered,
@@ -52,12 +58,6 @@ const getAvailableDrivers = async (req, res) => {
         ];
         const params = [];
 
-        // The car has to be the right class — by id, not by the old free-text
-        // column, which nobody ever typed the same way twice. Deliberately
-        // blind to who owns the car.
-        params.push(booking.vehicle_class_id || null);
-        const classParam = `$${params.length}`;
-
         if (tab === "fleet") {
             where.push("cf.driver_id IS NOT NULL");
         } else if (tab === "external") {
@@ -81,6 +81,7 @@ const getAvailableDrivers = async (req, res) => {
                     u.rating_average, u.rating_count, u.completed_trips,
                     v.id AS vehicle_id, v.registration_number, v.make, v.model,
                     v.vehicle_class, v.owner_type,
+                    v.seats, v.luggage_large, v.luggage_small,
                     (cf.driver_id IS NOT NULL)  AS is_fleet,
                     (fav.driver_id IS NOT NULL) AS is_favourite,
                     (SELECT COUNT(*)::int FROM bookings jb
@@ -94,7 +95,11 @@ const getAvailableDrivers = async (req, res) => {
                ON v.driver_id = u.id
               AND v.verification_status = 'approved'
               AND v.availability_status <> 'inactive'
-              AND (${classParam}::int IS NULL OR v.vehicle_class_id = ${classParam}::int)
+              -- The car has to actually hold the people and the luggage. Not a
+              -- class name — the real numbers, which mean the same thing to
+              -- everybody. A car whose capacity nobody has recorded still
+              -- appears, flagged; see the note in bookingValidation.js.
+              AND ${vehicleFits("v", booking)}
              LEFT JOIN company_drivers cf
                ON cf.driver_id = u.id AND cf.removed_at IS NULL
              LEFT JOIN operator_favourite_drivers fav
@@ -119,8 +124,19 @@ const getAvailableDrivers = async (req, res) => {
             booking: {
                 id: booking.id,
                 reference: booking.reference,
-                vehicle_class: booking.vehicle_class_name,
-                status: booking.status
+                status: booking.status,
+
+                // What the list was filtered on, repeated back so the screen
+                // can say "showing cars for 6 passengers and 5 bags" instead of
+                // leaving the operator to wonder why somebody is missing.
+                passengers: booking.passengers,
+                large_bags: booking.large_bags,
+                small_bags: booking.small_bags,
+
+                // What the client asked for, if they asked for anything. The
+                // one thing on this screen the system cannot check — the
+                // operator has to read it.
+                requested_vehicle: booking.requested_vehicle || null
             },
 
             tab,
@@ -158,8 +174,21 @@ const getAvailableDrivers = async (req, res) => {
                     registration_number: d.registration_number,
                     make: d.make,
                     model: d.model,
+                    // Free text the driver typed. Shown because an operator
+                    // reads "V Class" and knows what it means, but never
+                    // matched on — that was the September bug.
                     vehicle_class: d.vehicle_class,
-                    owner_type: d.owner_type
+                    owner_type: d.owner_type,
+
+                    seats: d.seats,
+                    luggage_large: d.luggage_large,
+                    luggage_small: d.luggage_small,
+
+                    // False when nobody has recorded what this car holds. The
+                    // car is still on the list — hiding it is how drivers
+                    // vanish without explanation — but the screen should mark
+                    // it so the operator knows to check before sending it.
+                    capacity_known: capacityKnown(d)
                 }
             }))
         });
@@ -272,7 +301,8 @@ const withdrawBookingOffer = async (req, res) => {
 // DELETE /api/v1/operator/bookings/:id/publish
 // -----------------------------------------------------------------------------
 // "Skip — Save as Unassigned" on the designer's screen. The job goes into the
-// open pool and any online driver with the right class of car can take it.
+// open pool, where any driver whose car actually holds the passengers and the
+// luggage can take it.
 const publishBooking = async (req, res) => {
     try {
         const { id } = req.params;
@@ -307,12 +337,12 @@ const publishBooking = async (req, res) => {
              JOIN vehicles v ON v.driver_id = u.id
                             AND v.verification_status = 'approved'
                             AND v.availability_status <> 'inactive'
-                            AND ($2::int IS NULL OR v.vehicle_class_id = $2)
+                            AND ${vehicleFits("v", booking)}
              WHERE u.role = 'driver'
                AND u.status = 'approved'
                AND u.suspension_reason IS DISTINCT FROM 'document_expired'
                AND u.id <> $1`,
-            [req.user.id, booking.vehicle_class_id || null]
+            [req.user.id]
         );
 
         for (const row of eligible.rows) {

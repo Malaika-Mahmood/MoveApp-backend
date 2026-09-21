@@ -1,0 +1,90 @@
+-- =============================================================================
+-- MoveApp — 018: match on real capacity, not on a class
+-- =============================================================================
+-- From the operator interview on 21 September.
+--
+-- About 80% of the time the client says how many people and how much luggage,
+-- and the operator decides which car suits. The other 20% the client names a
+-- car — and they can name anything. "Range Rover." "A BMW." "Something big."
+--
+-- That second case is what kills the idea of a fixed class list. A dropdown
+-- can only hold words we thought of in advance, and the client is not reading
+-- from our list. So the request is recorded as the client said it, and a human
+-- decides what to do about it. That is what the operator does today on the
+-- telephone, and it works.
+--
+-- Matching therefore moves to the numbers, which are the same in every
+-- language: does this car seat that many people, and take that much luggage.
+--
+-- vehicle_classes and vehicles.vehicle_class_id are NOT dropped. They are left
+-- in place, unused. Dropping a column is irreversible and this decision is two
+-- days old; leaving it costs nothing and buys the right to change our minds.
+--
+-- Safe to run more than once.
+-- =============================================================================
+
+BEGIN;
+
+-- -----------------------------------------------------------------------------
+-- What the client asked for, in their words
+-- -----------------------------------------------------------------------------
+-- Free text on purpose. "S Class", "Range Rover", "the big Mercedes", "same car
+-- as last time" — all of these are real things clients say, and all of them are
+-- useful to the operator. None of them would survive a dropdown.
+--
+-- This is shown prominently on the booking, never matched on.
+ALTER TABLE bookings
+    ADD COLUMN IF NOT EXISTS requested_vehicle VARCHAR(120);
+
+COMMENT ON COLUMN bookings.requested_vehicle IS
+    'What the client asked for, verbatim. Display only — never used for matching.';
+
+-- -----------------------------------------------------------------------------
+-- Capacity on the vehicle
+-- -----------------------------------------------------------------------------
+-- These columns already exist. What follows is documentation and an index,
+-- because from today they carry the weight that vehicle_class_id used to.
+--
+-- Deliberately left NULLABLE. A car whose capacity nobody has filled in yet is
+-- treated as "unknown", and unknown means SHOWN to the operator, flagged,
+-- rather than hidden.
+--
+-- That direction matters. In September a free-text class mismatch made drivers
+-- silently disappear from the assignment screen, with no error and no clue —
+-- it took two hours to find. Hiding is the dangerous default. An operator who
+-- can see a car with a question mark against its capacity will ask; an
+-- operator who cannot see it at all will never know it was there.
+COMMENT ON COLUMN vehicles.seats IS
+    'Real passenger seats, excluding the driver. NULL means not yet recorded.';
+COMMENT ON COLUMN vehicles.luggage_large IS
+    'Large cases the boot takes. NULL means not yet recorded.';
+COMMENT ON COLUMN vehicles.luggage_small IS
+    'Small bags on top of the large ones. NULL means not yet recorded.';
+
+-- Every assignment screen now filters on these three columns together with the
+-- two status columns. One index covering the lot.
+CREATE INDEX IF NOT EXISTS vehicles_capacity_lookup
+    ON vehicles (verification_status, availability_status, seats);
+
+COMMIT;
+
+
+-- =============================================================================
+-- After running — find the cars nobody can be matched to
+-- =============================================================================
+-- These are not broken, but the operator will see "capacity not recorded"
+-- against them until somebody fills them in during verification.
+--
+--   SELECT v.id, v.registration_number, v.make, v.model,
+--          v.seats, v.luggage_large, v.luggage_small,
+--          u.first_name, u.last_name
+--     FROM vehicles v
+--     JOIN users u ON u.id = v.driver_id
+--    WHERE v.seats IS NULL
+--       OR (v.luggage_large IS NULL AND v.luggage_small IS NULL)
+--    ORDER BY v.id;
+--
+-- Filling one in by hand:
+--
+--   UPDATE vehicles SET seats = 7, luggage_large = 7, luggage_small = 3
+--    WHERE registration_number = 'V300 ASD';

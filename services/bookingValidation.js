@@ -1,10 +1,12 @@
-const pool = require("../config/db");
 const {
     ALL_BOOKING_TYPES,
     BOOKING_TYPES,
     BOOKING_STATUS_LABELS,
     BOOKING_TYPE_LABELS
 } = require("../constants/bookings");
+
+// The database connection is no longer needed here. It was only ever used to
+// look up a vehicle class, and classes are gone — see the note further down.
 
 // Checking and shaping a booking.
 //
@@ -205,49 +207,150 @@ const validateBooking = async (body, { isUpdate = false } = {}) => {
         else values.special_instructions = notes || null;
     }
 
-    // ---- Vehicle class ----------------------------------------------------
-    if (has("vehicle_class_id")) {
-        const classId = Number(body.vehicle_class_id);
+    // ---- What the client asked for ----------------------------------------
+    // Free text, and free on purpose. The client can ask for a Range Rover, an
+    // S Class, "something big", or the same car as last time — a dropdown can
+    // only hold the words we thought of in advance, and the client is not
+    // reading from our list.
+    //
+    // Never matched on. It is shown to the operator, who does what they do
+    // today on the telephone: works out whether it can be done.
+    if (has("requested_vehicle")) {
+        const wanted = str(body.requested_vehicle);
 
-        if (!Number.isInteger(classId)) {
-            errors.push("vehicle_class_id must be a number");
-
+        if (wanted && wanted.length > 120) {
+            errors.push("requested_vehicle must be 120 characters or fewer");
         } else {
-            const result = await pool.query(
-                "SELECT * FROM vehicle_classes WHERE id = $1 AND is_active",
-                [classId]
-            );
-            const vehicleClass = result.rows[0];
-
-            if (!vehicleClass) {
-                errors.push("vehicle_class_id does not match an active vehicle class");
-
-            } else {
-                values.vehicle_class_id = classId;
-
-                // The screen already says "4 pax max · 3 bags". Letting an
-                // operator book six people into a saloon would only be
-                // discovered by the driver, at the kerb, with the client
-                // watching.
-                const pax = values.passengers ?? body.passengers;
-                if (pax && pax > vehicleClass.max_passengers) {
-                    errors.push(
-                        `${vehicleClass.name} carries up to ${vehicleClass.max_passengers} passengers, not ${pax}`
-                    );
-                }
-
-                const large = values.large_bags ?? body.large_bags;
-                if (large && large > vehicleClass.max_large_bags) {
-                    errors.push(
-                        `${vehicleClass.name} takes up to ${vehicleClass.max_large_bags} large bags, not ${large}`
-                    );
-                }
-            }
+            values.requested_vehicle = wanted || null;
         }
     }
 
+    // NOTE: vehicle_class_id is no longer accepted.
+    //
+    // Until 21 September a booking carried a class and drivers were matched on
+    // it. The operator interview ended that: the office matches on how many
+    // people and how much luggage, because those are the same in every
+    // language, and a class name is not.
+    //
+    // The column and the vehicle_classes table still exist (migration 018
+    // explains why) but nothing writes to them. A frontend still sending
+    // vehicle_class_id is ignored rather than rejected, the same as any other
+    // unknown field.
+
     return { errors, values };
 };
+
+// -----------------------------------------------------------------------------
+// Does this car fit this job?
+// -----------------------------------------------------------------------------
+// Written here, once, because the same question is asked from four places: the
+// operator's driver list, the pool notification, the driver's available-jobs
+// list, and the check before an offer is made. Four copies of a rule is a rule
+// that will be right in three places and wrong in the fourth, and nobody will
+// know which.
+//
+// ---------------------------------------------------------------------------
+// Unknown capacity means SHOWN, not hidden
+// ---------------------------------------------------------------------------
+// A car whose seats or luggage nobody has filled in yet passes every test
+// below. That is deliberate and it is the important decision in this file.
+//
+// In September a free-text class mismatch made drivers vanish from the
+// assignment screen — no error, no empty-state, no clue. It took two hours to
+// find. Hiding is the dangerous default: an operator who sees a car with a
+// question mark against it will ask; an operator who cannot see it at all
+// never learns it was there.
+//
+// The API says so out loud with `capacity_known: false`, and the screen shows
+// it, so nobody has to guess why a car is on the list.
+//
+// ---------------------------------------------------------------------------
+// Why the numbers are written into the SQL rather than parameterised
+// ---------------------------------------------------------------------------
+// Every value here comes from a bookings row this same server wrote, and each
+// one is forced through Math.trunc(Number(...)) below before it goes anywhere
+// near a query. Nothing a caller typed reaches this. Parameters would be
+// tidier, but these fragments get spliced into queries that already build
+// their own $1, $2 lists, and renumbering those by hand is exactly how an
+// off-by-one lands in production.
+
+// Coerce to a whole, non-negative number. Anything unreadable becomes the
+// fallback rather than breaking the query.
+const count = (value, fallback = 0) => {
+    const n = Math.trunc(Number(value));
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
+// For a booking already loaded into JavaScript.
+//   WHERE ... AND ${vehicleFits("v", booking)}
+const vehicleFits = (v, booking) => {
+    const passengers = count(booking?.passengers, 1);
+    const large = count(booking?.large_bags, 0);
+    const total = large + count(booking?.small_bags, 0);
+
+    return `(
+        (${v}.seats IS NULL OR ${v}.seats >= ${passengers})
+    AND (${v}.luggage_large IS NULL OR ${v}.luggage_large >= ${large})
+    AND (
+            (${v}.luggage_large IS NULL AND ${v}.luggage_small IS NULL)
+         OR COALESCE(${v}.luggage_large, 0) + COALESCE(${v}.luggage_small, 0) >= ${total}
+        )
+    )`;
+};
+
+// For a query where the bookings table is joined, so the numbers come from
+// columns rather than from JavaScript.
+//   WHERE ... AND ${vehicleFitsJoined("v", "b")}
+const vehicleFitsJoined = (v, b) => `(
+    (${v}.seats IS NULL OR ${v}.seats >= COALESCE(${b}.passengers, 1))
+AND (${v}.luggage_large IS NULL OR ${v}.luggage_large >= COALESCE(${b}.large_bags, 0))
+AND (
+        (${v}.luggage_large IS NULL AND ${v}.luggage_small IS NULL)
+     OR COALESCE(${v}.luggage_large, 0) + COALESCE(${v}.luggage_small, 0)
+        >= COALESCE(${b}.large_bags, 0) + COALESCE(${b}.small_bags, 0)
+    )
+)`;
+
+// The same question answered in JavaScript, for a vehicle row already in hand.
+// Returns null when the car fits, or a sentence saying why it does not — which
+// is what an operator needs to read when an offer is refused.
+const reasonVehicleCannotFit = (vehicle, booking) => {
+    if (!vehicle) return "That driver has no approved vehicle";
+
+    const passengers = count(booking?.passengers, 1);
+    const large = count(booking?.large_bags, 0);
+    const total = large + count(booking?.small_bags, 0);
+
+    if (vehicle.seats !== null && vehicle.seats !== undefined && vehicle.seats < passengers) {
+        return `That car seats ${vehicle.seats}, and this job is for ${passengers}`;
+    }
+
+    const hasLuggage =
+        (vehicle.luggage_large !== null && vehicle.luggage_large !== undefined) ||
+        (vehicle.luggage_small !== null && vehicle.luggage_small !== undefined);
+
+    if (hasLuggage) {
+        const vLarge = count(vehicle.luggage_large, 0);
+        const vTotal = vLarge + count(vehicle.luggage_small, 0);
+
+        if (vLarge < large) {
+            return `That car takes ${vLarge} large cases, and this job has ${large}`;
+        }
+        if (vTotal < total) {
+            return `That car takes ${vTotal} bags in total, and this job has ${total}`;
+        }
+    }
+
+    return null;
+};
+
+// Has anybody recorded what this car holds? Sent to the app so a car on the
+// list with no capacity can be labelled rather than silently trusted.
+const capacityKnown = (vehicle) =>
+    Boolean(vehicle) &&
+    vehicle.seats !== null && vehicle.seats !== undefined &&
+    ((vehicle.luggage_large !== null && vehicle.luggage_large !== undefined) ||
+        (vehicle.luggage_small !== null && vehicle.luggage_small !== undefined));
 
 // -----------------------------------------------------------------------------
 // Shaping
@@ -296,14 +399,17 @@ const toBooking = (b, { includeClientContact = true } = {}) => ({
         special_instructions: b.special_instructions
     },
 
-    vehicle_class: b.vehicle_class_id
-        ? {
-            id: b.vehicle_class_id,
-            code: b.vehicle_class_code || null,
-            name: b.vehicle_class_name || null,
-            max_passengers: b.vehicle_class_max_passengers ?? null
-        }
-        : null,
+    // What the client asked for, in their own words, or null in the ~80% of
+    // jobs where they only said how many people and how much luggage.
+    //
+    // The app should show this prominently when it is set. It is the one thing
+    // on the booking the system cannot check for the operator — they have to
+    // read it and decide.
+    requested_vehicle: b.requested_vehicle || null,
+
+    // Kept so an older build of the app does not break on a missing key. Always
+    // null on anything created after 21 September — see migration 018.
+    vehicle_class: null,
 
     driver: b.driver_id
         ? {
@@ -361,21 +467,23 @@ const toBooking = (b, { includeClientContact = true } = {}) => ({
 // everywhere at once instead of in whichever endpoint someone remembered.
 const BOOKING_SELECT = `
     b.*,
-    vc.code  AS vehicle_class_code,
-    vc.name  AS vehicle_class_name,
-    vc.max_passengers AS vehicle_class_max_passengers,
     d.first_name AS driver_first_name,
     d.last_name  AS driver_last_name,
     v.registration_number AS vehicle_registration,
     v.make  AS vehicle_make,
-    v.model AS vehicle_model
+    v.model AS vehicle_model,
+    v.seats AS vehicle_seats,
+    v.luggage_large AS vehicle_luggage_large,
+    v.luggage_small AS vehicle_luggage_small
 `;
 
+// The vehicle_classes join is gone. Nothing reads it any more, and a join that
+// exists only out of habit is a join somebody will eventually build a feature
+// on by mistake.
 const BOOKING_JOINS = `
     FROM bookings b
-    LEFT JOIN vehicle_classes vc ON vc.id = b.vehicle_class_id
-    LEFT JOIN users d            ON d.id  = b.driver_id
-    LEFT JOIN vehicles v         ON v.id  = b.vehicle_id
+    LEFT JOIN users d    ON d.id = b.driver_id
+    LEFT JOIN vehicles v ON v.id = b.vehicle_id
 `;
 
 module.exports = {
@@ -383,5 +491,10 @@ module.exports = {
     validateBooking,
     toBooking,
     BOOKING_SELECT,
-    BOOKING_JOINS
+    BOOKING_JOINS,
+
+    vehicleFits,
+    vehicleFitsJoined,
+    reasonVehicleCannotFit,
+    capacityKnown
 };

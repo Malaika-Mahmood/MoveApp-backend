@@ -12,6 +12,7 @@ const {
     secondsSince,
     shouldExposeOtp,
     isTestIdentifier,
+    isTestAdminIdentifier,
     getTestOtp
 } = require("../utils/otp");
 
@@ -149,14 +150,17 @@ const sendLoginCode = async (req, res, type) => {
 
         // Is this one of the listed test accounts?
         //
-        // Never for an admin, whatever the list says. An admin can open every
-        // driver's passport, so the one account that must never have a
-        // guessable code is theirs — and the cost of this line is nothing.
+        // An admin needs a third variable naming that exact number, on top of
+        // the two the list already needs. The admin app has to be built by
+        // somebody who cannot read the server's logs, so this has to be
+        // possible — but an admin can open every driver's passport, so it must
+        // never happen because somebody added a number to a list.
         //
-        // The list is empty unless TWO environment variables are set, and they
-        // are never set on the live deployment. See utils/otp.js.
+        // All of it is off unless those variables are set, and they are never
+        // set on the live deployment. See utils/otp.js.
         const isTestAccount =
-            isTestIdentifier(identifier) && user.role !== "admin";
+            isTestIdentifier(identifier) &&
+            (user.role !== "admin" || isTestAdminIdentifier(identifier));
 
         const live = await findLiveCode(identifier, type);
 

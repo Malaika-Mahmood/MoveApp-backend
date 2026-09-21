@@ -1,6 +1,11 @@
 const pool = require("../config/db");
 const offers = require("../services/bookingOffers");
-const { toBooking, BOOKING_SELECT, BOOKING_JOINS } = require("../services/bookingValidation");
+const {
+    toBooking,
+    BOOKING_SELECT,
+    BOOKING_JOINS,
+    vehicleFitsJoined
+} = require("../services/bookingValidation");
 const { DRIVER_STATUS_STEPS } = require("../constants/bookings");
 const {
     notifyOfferAccepted,
@@ -94,9 +99,8 @@ const listMyOffers = async (req, res) => {
                     ${BOOKING_SELECT}
              FROM booking_offers o
              JOIN bookings b ON b.id = o.booking_id
-             LEFT JOIN vehicle_classes vc ON vc.id = b.vehicle_class_id
-             LEFT JOIN users d            ON d.id  = b.driver_id
-             LEFT JOIN vehicles v         ON v.id  = b.vehicle_id
+             LEFT JOIN users d    ON d.id = b.driver_id
+             LEFT JOIN vehicles v ON v.id = b.vehicle_id
              WHERE o.driver_id = $1 AND o.status = 'pending'
              ORDER BY o.offered_at DESC`,
             [req.user.id]
@@ -225,22 +229,27 @@ const listAvailableJobs = async (req, res) => {
         const where = [
             "b.is_open_to_all",
             "b.status = 'pending'",
-            // Only jobs this driver's car can actually do. A list full of work
-            // they cannot take is not a list, it is a tease.
+            // Only jobs one of this driver's cars can actually do — enough
+            // seats, enough room for the bags. A list full of work they cannot
+            // take is not a list, it is a tease.
+            //
+            // "dv" rather than "v": the outer query already uses v for the
+            // booking's assigned vehicle, and reusing the alias here would
+            // silently compare the wrong car.
             `EXISTS (
-                SELECT 1 FROM vehicles v
-                WHERE v.driver_id = $1
-                  AND v.verification_status = 'approved'
-                  AND v.availability_status <> 'inactive'
-                  AND (b.vehicle_class_id IS NULL OR v.vehicle_class_id = b.vehicle_class_id)
+                SELECT 1 FROM vehicles dv
+                WHERE dv.driver_id = $1
+                  AND dv.verification_status = 'approved'
+                  AND dv.availability_status <> 'inactive'
+                  AND ${vehicleFitsJoined("dv", "b")}
              )`
         ];
         const params = [req.user.id];
 
-        if (req.query.vehicle_class) {
-            params.push(req.query.vehicle_class);
-            where.push(`vc.code = $${params.length}`);
-        }
+        // NOTE: the ?vehicle_class= filter is gone. Classes no longer exist —
+        // see migration 018. A driver filtering the pool by the size of job
+        // they want is a reasonable thing to add later, and it would be built
+        // on passengers and luggage, not on a class name.
 
         // "To Airport" / "From Airport". Matched on the address text, which is
         // rough, but it is what there is until addresses are structured.

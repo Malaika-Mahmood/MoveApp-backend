@@ -112,6 +112,37 @@ const isTestIdentifier = (identifier) => {
 
 const getTestOtp = () => TEST_OTP_VALUE;
 
+// ---------------------------------------------------------------------------
+// The test admin
+// ---------------------------------------------------------------------------
+// An admin can open every driver's passport and every operator's licence, so
+// an admin account with a guessable code is the worst thing in this file. It
+// is allowed only because the admin screens have to be built by somebody who
+// cannot read the server's logs.
+//
+// It gets its own variable rather than another entry in the list above, for
+// one reason: nobody can enable it by accident. Adding a number to a list is a
+// small act; naming a variable TEST_ADMIN_PHONE is a decision. And if it ever
+// appears in a production settings page, the name alone says what is wrong.
+//
+// One number, not a list. There is no reason to need two.
+const TEST_ADMIN_VALUE = String(process.env.TEST_ADMIN_PHONE || "").trim();
+
+// The number must ALSO be in the main list. Two variables have to agree, so
+// TEST_ADMIN_PHONE on its own is not a second, quieter way in.
+const isTestAdminIdentifier = (identifier) => {
+    if (!TEST_ADMIN_VALUE) return false;
+    if (!isTestIdentifier(identifier)) return false;
+
+    const wanted = digitsOnly(identifier);
+    if (!wanted) return false;
+
+    return (
+        TEST_ADMIN_VALUE === identifier ||
+        digitsOnly(TEST_ADMIN_VALUE) === wanted
+    );
+};
+
 // Said once, at startup, loudly.
 if (TEST_OTP_VALUE && !TEST_OTP_IS_VALID) {
     console.warn(
@@ -123,7 +154,18 @@ if (TEST_OTP_VALUE && !TEST_OTP_IS_VALID) {
     console.warn("=================================================================");
     console.warn(`TEST OTP ENABLED for ${TEST_IDENTIFIERS.length} number(s).`);
     console.warn("These accounts accept one fixed code. NEVER enable this on live.");
+
+    if (TEST_ADMIN_VALUE) {
+        // Its own line, because this is the part somebody should notice from
+        // across the room.
+        console.warn("   >>> ONE OF THEM IS AN ADMIN ACCOUNT <<<");
+    }
+
     console.warn("=================================================================");
+}
+
+if (TEST_ADMIN_VALUE && testAccountsEnabled() && !isTestIdentifier(TEST_ADMIN_VALUE)) {
+    console.warn("TEST_ADMIN_PHONE is set but is not listed in TEST_PHONE_NUMBERS — it will not work.");
 }
 
 module.exports = {
@@ -141,5 +183,6 @@ module.exports = {
 
     testAccountsEnabled,
     isTestIdentifier,
+    isTestAdminIdentifier,
     getTestOtp
 };

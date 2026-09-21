@@ -6,6 +6,7 @@ const {
     canTransition,
     DRIVER_STATUS_STEPS
 } = require("../constants/bookings");
+const { reasonVehicleCannotFit } = require("./bookingValidation");
 
 // Getting a job from an operator to a driver, and through to the end of the
 // journey.
@@ -33,30 +34,34 @@ const {
 // because checking it in five and then acting would leave room for the answer
 // to change in between.
 //
-// The vehicle matters as much as the driver: a booking asks for a class, and
-// the driver's car has to be that class and have passed verification. This is
-// also the only place the fleet question is settled — a company car and an
-// outside driver's car are judged by exactly the same rule.
+// The vehicle matters as much as the driver: the car has to have passed
+// verification and it has to hold the people and the luggage. This is also the
+// only place the fleet question is settled — a company car and an outside
+// driver's car are judged by exactly the same rule.
 //
-// Matched on vehicle_class_id, never on the old free-text vehicle_class. One
-// driver wrote "Executive Saloon" where the class list says "saloon", and
-// string comparison found nothing — no error, just an empty list of drivers
-// and no clue why. See migration 015.
-const loadAssignableDriver = async (client, driverId, booking) => {
+// The join deliberately does NOT filter on capacity. It loads the driver's
+// approved, available car and lets reasonDriverCannotTake say what is wrong
+// with it.
+//
+// Filtering here instead would return vehicle_id null, and the operator would
+// be told "that driver has no approved vehicle" — which is untrue, and sends
+// them hunting for a document problem that does not exist. "That car seats 4,
+// and this job is for 7" is the sentence they can act on.
+const loadAssignableDriver = async (client, driverId) => {
     const result = await client.query(
         `SELECT u.id, u.first_name, u.last_name, u.status,
                 u.suspension_reason, u.is_online,
-                v.id AS vehicle_id, v.registration_number, v.vehicle_class
+                v.id AS vehicle_id, v.registration_number, v.vehicle_class,
+                v.seats, v.luggage_large, v.luggage_small
          FROM users u
          LEFT JOIN vehicles v
                 ON v.driver_id = u.id
                AND v.verification_status = 'approved'
                AND v.availability_status <> 'inactive'
-               AND ($2::int IS NULL OR v.vehicle_class_id = $2)
          WHERE u.id = $1 AND u.role = 'driver'
          ORDER BY v.id ASC
          LIMIT 1`,
-        [driverId, booking.vehicle_class_id || null]
+        [driverId]
     );
 
     return result.rows[0] || null;
@@ -78,12 +83,25 @@ const reasonDriverCannotTake = (driver, booking) => {
     }
 
     if (!driver.vehicle_id) {
-        return booking.vehicle_class_name
-            ? `That driver has no approved ${booking.vehicle_class_name}`
-            : "That driver has no approved vehicle";
+        return "That driver has no approved vehicle";
     }
 
-    return null;
+    // Capacity last, because it is the only refusal the operator can do
+    // something about — a bigger car, or a word with the client about the
+    // luggage. The sentence names both numbers so they do not have to go and
+    // look either of them up.
+    //
+    // A car with no recorded capacity passes. The operator can see it is
+    // unrecorded on the assignment screen and decide for themselves; refusing
+    // here would block a job over a blank field.
+    return reasonVehicleCannotFit(
+        {
+            seats: driver.seats,
+            luggage_large: driver.luggage_large,
+            luggage_small: driver.luggage_small
+        },
+        booking
+    );
 };
 
 // -----------------------------------------------------------------------------
@@ -137,9 +155,8 @@ const offerToDriver = async (bookingId, driverId, operatorId) => {
         await expireDueOffers(client);
 
         const bookingResult = await client.query(
-            `SELECT b.*, vc.code AS vehicle_class_code, vc.name AS vehicle_class_name
+            `SELECT b.*
              FROM bookings b
-             LEFT JOIN vehicle_classes vc ON vc.id = b.vehicle_class_id
              WHERE b.id = $1
              FOR UPDATE OF b`,
             [bookingId]
@@ -163,7 +180,7 @@ const offerToDriver = async (bookingId, driverId, operatorId) => {
             return { error: "CANNOT_OFFER", message };
         }
 
-        const driver = await loadAssignableDriver(client, driverId, booking);
+        const driver = await loadAssignableDriver(client, driverId);
         const refusal = reasonDriverCannotTake(driver, booking);
 
         if (refusal) {
@@ -339,9 +356,8 @@ const respondToOffer = async (driverId, offerId, decision, vehicleId = null) => 
 
         // ---- Accepting ------------------------------------------------------
         const bookingResult = await client.query(
-            `SELECT b.*, vc.code AS vehicle_class_code, vc.name AS vehicle_class_name
+            `SELECT b.*
              FROM bookings b
-             LEFT JOIN vehicle_classes vc ON vc.id = b.vehicle_class_id
              WHERE b.id = $1
              FOR UPDATE OF b`,
             [offer.booking_id]
@@ -356,7 +372,7 @@ const respondToOffer = async (driverId, offerId, decision, vehicleId = null) => 
             };
         }
 
-        const driver = await loadAssignableDriver(client, driverId, booking);
+        const driver = await loadAssignableDriver(client, driverId);
         const refusal = reasonDriverCannotTake(driver, booking);
 
         // Checked again at the moment of accepting, not only when offering. A
@@ -414,9 +430,8 @@ const claimOpenJob = async (driverId, bookingId, vehicleId = null) => {
         await client.query("BEGIN");
 
         const bookingResult = await client.query(
-            `SELECT b.*, vc.code AS vehicle_class_code, vc.name AS vehicle_class_name
+            `SELECT b.*
              FROM bookings b
-             LEFT JOIN vehicle_classes vc ON vc.id = b.vehicle_class_id
              WHERE b.id = $1
              FOR UPDATE OF b`,
             [bookingId]
@@ -436,7 +451,7 @@ const claimOpenJob = async (driverId, bookingId, vehicleId = null) => {
             };
         }
 
-        const driver = await loadAssignableDriver(client, driverId, booking);
+        const driver = await loadAssignableDriver(client, driverId);
         const refusal = reasonDriverCannotTake(driver, booking);
 
         if (refusal) {

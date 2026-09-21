@@ -30,7 +30,13 @@ const WRITABLE = [
     "scheduled_at", "duration_hours", "flight_number",
     "passengers", "large_bags", "small_bags",
     "child_seat", "wheelchair_accessible", "special_instructions",
-    "vehicle_class_id"
+
+    // What the client asked for, in their own words — "Range Rover",
+    // "S Class", "something big". This replaced vehicle_class_id on 21
+    // September: a client can name any car at all, so a fixed list of classes
+    // could never hold what they actually say. Matching runs on passengers and
+    // luggage instead, and this field is for the operator to read.
+    "requested_vehicle"
 ];
 
 const loadBooking = async (id) => {
@@ -399,26 +405,28 @@ const cancelBooking = async (req, res) => {
 };
 
 // -----------------------------------------------------------------------------
-// GET /api/v1/vehicle-classes
+// GET /api/v1/vehicle-classes  — RETIRED
 // -----------------------------------------------------------------------------
-// Every role needs this: the operator to choose one, the driver to say what
-// their car is, the app to label a booking.
+// Kept so that an app build still calling it gets a clear answer rather than a
+// 404 it has no code path for. It now returns an empty list every time.
+//
+// Classes went on 21 September. A client can ask for any car in the world —
+// "Range Rover", "the big Mercedes", "same as last time" — and a dropdown can
+// only ever hold the words we thought of first. So the request is recorded as
+// the client said it, in booking.requested_vehicle, and cars are matched on
+// how many people and how much luggage they hold.
+//
+// Empty rather than the three placeholder rows still sitting in the table: an
+// app that draws a dropdown from this should draw nothing, not three invented
+// names from a design mock-up.
 const listVehicleClasses = async (req, res) => {
-    try {
-        const result = await pool.query(
-            `SELECT id, code, name, description, max_passengers,
-                    max_large_bags, max_small_bags, features
-             FROM vehicle_classes
-             WHERE is_active
-             ORDER BY sort_order ASC, id ASC`
-        );
-
-        res.status(200).json({ vehicle_classes: result.rows });
-
-    } catch (error) {
-        console.error("Error in listVehicleClasses:", error);
-        res.status(500).json({ message: "Something went wrong while fetching vehicle classes" });
-    }
+    res.status(200).json({
+        vehicle_classes: [],
+        retired: true,
+        message:
+            "Vehicle classes are no longer used. Bookings carry requested_vehicle " +
+            "as free text, and drivers are matched on passengers and luggage."
+    });
 };
 
 module.exports = {
