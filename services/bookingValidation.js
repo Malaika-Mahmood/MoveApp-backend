@@ -2,7 +2,11 @@ const {
     ALL_BOOKING_TYPES,
     BOOKING_TYPES,
     BOOKING_STATUS_LABELS,
-    BOOKING_TYPE_LABELS
+    BOOKING_TYPE_LABELS,
+    ALL_FARE_MODES,
+    FARE_MODE,
+    isValidAmount,
+    toAmount
 } = require("../constants/bookings");
 
 // The database connection is no longer needed here. It was only ever used to
@@ -223,6 +227,58 @@ const validateBooking = async (body, { isUpdate = false } = {}) => {
         } else {
             values.requested_vehicle = wanted || null;
         }
+    }
+
+    // ---- How the job is priced -------------------------------------------
+    // The Fare Details step on the operator's New Booking screen: one price,
+    // or a window for drivers to bid in.
+    //
+    // Also settable at publish time, because an operator may put a job in
+    // unassigned with no price and decide the number later.
+    if (has("fare_mode")) {
+        if (!ALL_FARE_MODES.includes(body.fare_mode)) {
+            errors.push(`fare_mode must be one of: ${ALL_FARE_MODES.join(", ")}`);
+        } else {
+            values.fare_mode = body.fare_mode;
+        }
+    }
+
+    const mode = values.fare_mode || body.fare_mode;
+
+    if (has("fixed_amount")) {
+        const amount = toAmount(body.fixed_amount);
+
+        // Null is allowed and means exactly what it says: no price yet. The
+        // operator interview was explicit that jobs go out that way.
+        if (amount !== null && !isValidAmount(amount)) {
+            errors.push("fixed_amount is not a valid amount");
+        } else {
+            values.fixed_amount = amount;
+        }
+    }
+
+    for (const key of ["bid_low", "bid_high"]) {
+        if (!has(key)) continue;
+        const amount = toAmount(body[key]);
+
+        if (amount !== null && !isValidAmount(amount)) {
+            errors.push(`${key} is not a valid amount`);
+        } else {
+            values[key] = amount;
+        }
+    }
+
+    const low = values.bid_low ?? null;
+    const high = values.bid_high ?? null;
+
+    if (low !== null && high !== null && low > high) {
+        errors.push("bid_low cannot be above bid_high");
+    }
+
+    // A bidding job with no window is a bidding job nobody can bid on — the
+    // driver's screen has nothing to put on the plus and minus buttons.
+    if (mode === FARE_MODE.BIDDING && !isUpdate && (low === null || high === null)) {
+        errors.push("A bidding job needs both bid_low and bid_high");
     }
 
     // NOTE: vehicle_class_id is no longer accepted.

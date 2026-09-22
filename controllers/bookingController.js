@@ -36,7 +36,12 @@ const WRITABLE = [
     // September: a client can name any car at all, so a fixed list of classes
     // could never hold what they actually say. Matching runs on passengers and
     // luggage instead, and this field is for the operator to read.
-    "requested_vehicle"
+    "requested_vehicle",
+
+    // The Fare Details step. 'fixed' with one amount, or 'bidding' with a
+    // window drivers bid inside. Whose money this is has not been decided —
+    // see migration 019.
+    "fare_mode", "fixed_amount", "bid_low", "bid_high"
 ];
 
 const loadBooking = async (id) => {
