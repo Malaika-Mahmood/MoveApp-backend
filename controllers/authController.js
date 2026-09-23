@@ -1,6 +1,6 @@
 const jwt = require("jsonwebtoken");
 const pool = require("../config/db");
-const { sendEmailOtp } = require("../services/notificationService");
+const { sendEmailOtp, sendSmsOtp } = require("../services/notificationService");
 const {
     OTP_TTL_MINUTES,
     MAX_VERIFY_ATTEMPTS,
@@ -11,7 +11,9 @@ const {
     otpMatches,
     otpExpiryDate,
     secondsSince,
-    shouldExposeOtp
+    shouldExposeOtp,
+    isTestIdentifier,
+    getTestOtp
 } = require("../utils/otp");
 
 const TOKEN_EXPIRY = "7d";
@@ -31,6 +33,10 @@ const PHONE_REGEX = /^\+?[0-9\s\-()]{7,20}$/;
 //
 // `admin` is deliberately not accepted here. The first admin is inserted by
 // hand; after that an admin creates the others through /api/v1/admin/admins.
+//
+// This matters more than it used to. Sign-up now issues a fixed code to any
+// number on the test list, and the ONLY reason that is safe is that this list
+// cannot produce an admin.
 const SIGNUP_ROLES = ["driver", "operator"];
 
 const issueAccessToken = (user) => {
@@ -44,16 +50,50 @@ const issueAccessToken = (user) => {
     );
 };
 
-const findActiveRegistration = async (email) => {
-    const cleanEmail = String(email).trim().toLowerCase();
+// ---------------------------------------------------------------------------
+// Finding a sign-up in progress
+// ---------------------------------------------------------------------------
+// The phone is now what identifies a sign-up, because the phone is what the
+// code was sent to.
+//
+// Email lookup is kept alongside it, and deliberately so: anyone who started
+// signing up before this deployed has a row keyed on their email and a code in
+// their inbox. Removing the email path would leave them stuck at a screen that
+// can no longer find them. It costs one small function to not do that to
+// people, and it can come out once those rows have expired.
+const findActiveRegistrationByPhone = async (phone) => {
+    const result = await pool.query(
+        `SELECT * FROM pending_registrations
+         WHERE phone = $1 AND consumed_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [String(phone).trim()]
+    );
+    return result.rows[0] || null;
+};
+
+const findActiveRegistrationByEmail = async (email) => {
     const result = await pool.query(
         `SELECT * FROM pending_registrations
          WHERE LOWER(email) = $1 AND consumed_at IS NULL
          ORDER BY created_at DESC
          LIMIT 1`,
-        [cleanEmail]
+        [String(email).trim().toLowerCase()]
     );
     return result.rows[0] || null;
+};
+
+// Whichever the app sent. Phone first — that is the new contract, and the one
+// the frontend should move to.
+const findActiveRegistration = async ({ phone, email }) => {
+    if (phone) {
+        const byPhone = await findActiveRegistrationByPhone(phone);
+        if (byPhone) return byPhone;
+    }
+    if (email) {
+        return findActiveRegistrationByEmail(email);
+    }
+    return null;
 };
 
 // STEP 1 OF SIGN-UP
@@ -111,12 +151,28 @@ const registerStart = async (req, res) => {
             });
         }
 
-        const active = await findActiveRegistration(cleanEmail);
+        // Is this one of the listed test numbers?
+        //
+        // Sign-up cannot create an admin — SIGNUP_ROLES has two entries and
+        // neither is 'admin' — so unlike login there is no admin exception to
+        // make here. The worst this can produce is a driver or operator
+        // account sitting at 'account_created', which can see nothing and do
+        // nothing until a human approves its documents.
+        //
+        // All of it is off unless TEST_OTP and TEST_PHONE_NUMBERS are both
+        // set. See utils/otp.js.
+        const isTestAccount = isTestIdentifier(cleanPhone);
+
+        const active = await findActiveRegistrationByPhone(cleanPhone);
 
         if (active) {
             const waited = secondsSince(active.last_sent_at);
 
-            if (waited < RESEND_COOLDOWN_SECONDS) {
+            // The wait between codes exists to stop somebody running up an SMS
+            // bill. A test number sends no message and costs nothing, and the
+            // person using it is asking for a code every thirty seconds while
+            // they build a screen.
+            if (!isTestAccount && waited < RESEND_COOLDOWN_SECONDS) {
                 return res.status(429).json({
                     message: "A code was just sent. Please wait before requesting another.",
                     retry_after_seconds: RESEND_COOLDOWN_SECONDS - waited
@@ -129,7 +185,13 @@ const registerStart = async (req, res) => {
             );
         }
 
-        const otp = generateOtp();
+        // The ONLY difference for a test number is that the digits are known
+        // in advance. The code is hashed the same way, expires in the same
+        // five minutes, is spent once, and allows the same five attempts.
+        // Verification neither knows nor cares that this was a test number,
+        // which is what makes it safe: there is no second way in, only a
+        // predictable code.
+        const otp = isTestAccount ? getTestOtp() : generateOtp();
 
         await pool.query(
             `INSERT INTO pending_registrations
@@ -139,13 +201,30 @@ const registerStart = async (req, res) => {
                 requestedRole, hashOtp(otp), otpExpiryDate()]
         );
 
-        await sendEmailOtp(cleanEmail, otp);
+        // Nothing is sent for a test number. It belongs to nobody, and once
+        // this runs through a real provider a message to a made-up number is a
+        // failed send and a charge. The code is in the database either way,
+        // which is all that matters.
+        if (!isTestAccount) {
+            await sendSmsOtp(cleanPhone, otp);
+        }
 
         res.status(200).json({
-            message: "Verification code sent to your email",
+            message: "Verification code sent to your phone",
+
+            // Both are returned. The app needs the phone for the next call;
+            // the email is echoed so a sign-up screen can show what it is
+            // about to create without holding it itself.
+            phone: cleanPhone,
             email: cleanEmail,
             role: requestedRole,
             expires_in_minutes: OTP_TTL_MINUTES,
+
+            // Said out loud so nobody sits waiting for a text that is never
+            // coming, and so it is obvious in a screenshot that this was a
+            // test number rather than a real sign-up.
+            ...(isTestAccount ? { test_account: true } : {}),
+
             ...(shouldExposeOtp() ? { dev_otp: otp } : {})
         });
 
@@ -162,16 +241,17 @@ const registerVerify = async (req, res) => {
     const client = await pool.connect();
 
     try {
-        const { email, otp } = req.body;
+        const { phone, email, otp } = req.body;
 
-        if (!email || !otp) {
-            return res.status(400).json({ message: "Email and OTP are required" });
+        // Phone is the contract from here on. Email is still accepted so that
+        // a sign-up begun before this deployed can still be finished.
+        if ((!phone && !email) || !otp) {
+            return res.status(400).json({ message: "Phone and OTP are required" });
         }
 
-        const cleanEmail = String(email).trim().toLowerCase();
         const cleanOtp = String(otp).trim();
 
-        const pending = await findActiveRegistration(cleanEmail);
+        const pending = await findActiveRegistration({ phone, email });
 
         if (!pending || new Date(pending.expires_at) <= new Date()) {
             return res.status(400).json({
@@ -218,11 +298,16 @@ const registerVerify = async (req, res) => {
         // documents and council licences.
         await client.query("BEGIN");
 
+        // phone_verified TRUE, email_verified FALSE — the reverse of what this
+        // used to write, and the whole point of the change. The code went to
+        // the phone, so the phone is what has been proved. The email has been
+        // typed and nothing more; saying otherwise would be a lie the next
+        // feature builds on.
         const newUser = await client.query(
             `INSERT INTO users
                 (first_name, middle_name, last_name, email, phone, role, status,
                  email_verified, phone_verified)
-             VALUES ($1, $2, $3, $4, $5, $6, 'account_created', TRUE, FALSE)
+             VALUES ($1, $2, $3, $4, $5, $6, 'account_created', FALSE, TRUE)
              RETURNING id, first_name, middle_name, last_name, email, phone, role, status,
                        email_verified, phone_verified, created_at`,
             [pending.first_name, pending.middle_name, pending.last_name,
@@ -266,18 +351,17 @@ const registerVerify = async (req, res) => {
 
 const registerResend = async (req, res) => {
     try {
-        const { email } = req.body;
+        const { phone, email } = req.body;
 
-        if (!email) {
-            return res.status(400).json({ message: "Email is required" });
+        if (!phone && !email) {
+            return res.status(400).json({ message: "Phone is required" });
         }
 
-        const cleanEmail = String(email).trim().toLowerCase();
-        const pending = await findActiveRegistration(cleanEmail);
+        const pending = await findActiveRegistration({ phone, email });
 
         if (!pending) {
             return res.status(404).json({
-                message: "No pending registration found for this email. Please start again."
+                message: "No pending registration found for this number. Please start again."
             });
         }
 
@@ -287,16 +371,17 @@ const registerResend = async (req, res) => {
             });
         }
 
+        const isTestAccount = isTestIdentifier(pending.phone);
         const waited = secondsSince(pending.last_sent_at);
 
-        if (waited < RESEND_COOLDOWN_SECONDS) {
+        if (!isTestAccount && waited < RESEND_COOLDOWN_SECONDS) {
             return res.status(429).json({
                 message: "Please wait before requesting another code",
                 retry_after_seconds: RESEND_COOLDOWN_SECONDS - waited
             });
         }
 
-        const otp = generateOtp();
+        const otp = isTestAccount ? getTestOtp() : generateOtp();
 
         await pool.query(
             `UPDATE pending_registrations
@@ -309,11 +394,14 @@ const registerResend = async (req, res) => {
             [hashOtp(otp), otpExpiryDate(), pending.id]
         );
 
-        await sendEmailOtp(pending.email, otp);
+        if (!isTestAccount) {
+            await sendSmsOtp(pending.phone, otp);
+        }
 
         res.status(200).json({
-            message: "A new verification code has been sent to your email",
+            message: "A new verification code has been sent to your phone",
             expires_in_minutes: OTP_TTL_MINUTES,
+            ...(isTestAccount ? { test_account: true } : {}),
             ...(shouldExposeOtp() ? { dev_otp: otp } : {})
         });
 
@@ -332,3 +420,9 @@ const createAccount = async (req, res) => {
 };
 
 module.exports = { registerStart, registerVerify, registerResend, createAccount };
+
+// Deliberately unused for now, and kept imported so the next person sees it:
+// sendEmailOtp still serves login by email (otpController). Sign-up no longer
+// uses it. If email verification is ever added back as a second step, this is
+// where it goes — after the account exists, not before it.
+void sendEmailOtp;
