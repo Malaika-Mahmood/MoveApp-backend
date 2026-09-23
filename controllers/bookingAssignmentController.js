@@ -38,10 +38,15 @@ const loadBooking = async (id) => {
 // GET /api/v1/operator/bookings/:id/available-drivers
 // -----------------------------------------------------------------------------
 // ?tab=all|favourites|fleet|external
+// ?search=ahmed          a name, or part of a registration number
 //
 // The four tabs on the assignment screen. They are filters over one list, not
 // four different lists — a driver can be on the fleet AND a favourite, and
 // counting them twice would be wrong.
+//
+// Search narrows whichever tab is open rather than replacing it: an operator
+// typing a name while Favourites is selected means "which of my favourites is
+// this", not "search everybody".
 const getAvailableDrivers = async (req, res) => {
     try {
         const { id } = req.params;
@@ -78,6 +83,42 @@ const getAvailableDrivers = async (req, res) => {
 
         if (tab === "favourites") {
             where.push("fav.driver_id IS NOT NULL");
+        }
+
+        // The search box above the list.
+        //
+        // Matched against first name, last name, the two joined, and the
+        // registration number — because an operator looking for a particular
+        // driver thinks in whichever of those they happen to remember, and
+        // often it is the car.
+        //
+        // The "two joined" case is the one that is easy to leave out: without
+        // it, typing "ali khan" matches nobody, since no single column holds
+        // both halves.
+        //
+        // Contact details are deliberately not searchable. An operator can see
+        // a driver's number once the job is theirs; letting the whole driver
+        // list be probed by phone number is a different thing.
+        //
+        // Bound as a parameter, never interpolated. ILIKE with a user-supplied
+        // string glued into SQL is exactly how an injection gets in.
+        const search = String(req.query.search || "").trim();
+
+        if (search.length > 0) {
+            // % and _ are wildcards to ILIKE. A driver whose name really does
+            // contain one is unlikely, but an operator pasting a stray % and
+            // getting the entire list back is a confusing five minutes.
+            const term = `%${search.replace(/[%_\\]/g, "\\$&")}%`;
+
+            params.push(term);
+            const searchParam = `$${params.length}`;
+
+            where.push(`(
+                u.first_name ILIKE ${searchParam} ESCAPE '\\'
+                OR u.last_name ILIKE ${searchParam} ESCAPE '\\'
+                OR (u.first_name || ' ' || u.last_name) ILIKE ${searchParam} ESCAPE '\\'
+                OR v.registration_number ILIKE ${searchParam} ESCAPE '\\'
+            )`);
         }
 
         const result = await pool.query(
@@ -149,6 +190,11 @@ const getAvailableDrivers = async (req, res) => {
             },
 
             tab,
+
+            // Echoed back so a screen showing three drivers can say "3 results
+            // for 'ali'" rather than leaving the operator to wonder where
+            // everybody went. Empty search comes back as null, not "".
+            search: search.length > 0 ? search : null,
 
             drivers: result.rows.map((d) => ({
                 // The operator sees the driver's name and everything about

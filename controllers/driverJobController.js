@@ -6,7 +6,7 @@ const {
     BOOKING_JOINS,
     vehicleFitsJoined
 } = require("../services/bookingValidation");
-const { DRIVER_STATUS_STEPS } = require("../constants/bookings");
+const { DRIVER_STATUS_STEPS, ALL_FARE_MODES } = require("../constants/bookings");
 const {
     notifyOfferAccepted,
     notifyOfferDeclined,
@@ -207,9 +207,19 @@ const respondToOffer = async (req, res) => {
 // -----------------------------------------------------------------------------
 // The open pool — "Live Jobs Available Now".
 //
-// Filters match the designer's screen: vehicle class, direction, sort. Distance
-// is not here because driver location does not exist yet; adding a filter that
-// silently does nothing would be worse than leaving it out.
+// Filters, all optional:
+//
+//   ?vehicle_id=12                     "today I am driving this one"
+//   ?fare_mode=fixed|bidding           the two tabs on the designer's screen
+//   ?direction=to_airport|from_airport
+//   ?sort=soonest|highest_fare|newest
+//
+// Distance and Nearest are NOT here, and that is deliberate: driver location
+// does not exist anywhere in this system yet, and a filter that silently does
+// nothing is worse than a filter that is absent. Payment (Card / Cash /
+// Account) is absent for the same kind of reason — a booking has no payment
+// method until the payments work lands. The response says both out loud in
+// `notes` so the app does not have to guess.
 const listAvailableJobs = async (req, res) => {
     try {
         if (req.user.role !== "driver") {
@@ -225,30 +235,123 @@ const listAvailableJobs = async (req, res) => {
 
         await offers.expireDueOffers();
 
-        const where = [
-            "b.is_open_to_all",
-            "b.status = 'pending'",
-            // Only jobs one of this driver's cars can actually do — enough
-            // seats, enough room for the bags. A list full of work they cannot
-            // take is not a list, it is a tease.
-            //
-            // "dv" rather than "v": the outer query already uses v for the
-            // booking's assigned vehicle, and reusing the alias here would
-            // silently compare the wrong car.
-            `EXISTS (
+        const params = [req.user.id];
+
+        // ---------------------------------------------------------------
+        // "Which car am I in today?"
+        // ---------------------------------------------------------------
+        // A driver can have more than one vehicle. Without this the pool is
+        // every job that ANY of their cars could do, which is wrong the moment
+        // they are out in the small one and half the list needs the big one.
+        //
+        // Checked against the driver's own vehicles first. Not for secrecy —
+        // there is nothing secret about a vehicle id — but because a filter
+        // that silently matches nothing sends somebody hunting for a bug in
+        // the wrong place. A 404 says what happened.
+        let chosenVehicle = null;
+
+        if (req.query.vehicle_id !== undefined && req.query.vehicle_id !== "") {
+            if (!/^\d+$/.test(String(req.query.vehicle_id))) {
+                return res.status(400).json({
+                    message: "vehicle_id must be a number",
+                    error_code: "INVALID_VEHICLE_ID"
+                });
+            }
+
+            const owned = await pool.query(
+                `SELECT id, registration_number, make, model,
+                        seats, luggage_large, luggage_small,
+                        verification_status, availability_status
+                   FROM vehicles
+                  WHERE id = $1 AND driver_id = $2`,
+                [Number(req.query.vehicle_id), req.user.id]
+            );
+
+            chosenVehicle = owned.rows[0] || null;
+
+            if (!chosenVehicle) {
+                return res.status(404).json({
+                    message: "That is not one of your vehicles",
+                    error_code: "VEHICLE_NOT_FOUND"
+                });
+            }
+
+            // An unapproved or inactive car would match nothing at all. Say
+            // why, rather than returning an empty list the driver reads as
+            // "there is no work today".
+            if (chosenVehicle.verification_status !== "approved") {
+                return res.status(409).json({
+                    message: "That vehicle is not approved yet, so it cannot be matched to jobs",
+                    error_code: "VEHICLE_NOT_APPROVED"
+                });
+            }
+
+            if (chosenVehicle.availability_status === "inactive") {
+                return res.status(409).json({
+                    message: "That vehicle is marked inactive",
+                    error_code: "VEHICLE_INACTIVE"
+                });
+            }
+        }
+
+        // Only jobs the car can actually do — enough seats, enough room for
+        // the bags. A list full of work they cannot take is not a list, it is
+        // a tease.
+        //
+        // "dv" rather than "v": the outer query already uses v for the
+        // booking's assigned vehicle, and reusing the alias here would
+        // silently compare the wrong car.
+        //
+        // One vehicle when they picked one, any of theirs when they did not.
+        let vehicleClause;
+
+        if (chosenVehicle) {
+            params.push(chosenVehicle.id);
+            vehicleClause = `EXISTS (
+                SELECT 1 FROM vehicles dv
+                WHERE dv.id = $${params.length}
+                  AND dv.driver_id = $1
+                  AND ${vehicleFitsJoined("dv", "b")}
+             )`;
+        } else {
+            vehicleClause = `EXISTS (
                 SELECT 1 FROM vehicles dv
                 WHERE dv.driver_id = $1
                   AND dv.verification_status = 'approved'
                   AND dv.availability_status <> 'inactive'
                   AND ${vehicleFitsJoined("dv", "b")}
-             )`
+             )`;
+        }
+
+        const where = [
+            "b.is_open_to_all",
+            "b.status = 'pending'",
+            vehicleClause
         ];
-        const params = [req.user.id];
 
         // NOTE: the ?vehicle_class= filter is gone. Classes no longer exist —
-        // see migration 018. A driver filtering the pool by the size of job
-        // they want is a reasonable thing to add later, and it would be built
-        // on passengers and luggage, not on a class name.
+        // see migration 018. What replaced it is the line above: the driver
+        // picks a real car of theirs, and the match runs on that car's seats
+        // and luggage rather than on a class name the client never used.
+
+        // ---------------------------------------------------------------
+        // Fixed price / Bidding — the two buttons
+        // ---------------------------------------------------------------
+        // Validated rather than passed through. An unknown value silently
+        // returning nothing would look exactly like "no work available".
+        if (req.query.fare_mode !== undefined && req.query.fare_mode !== "") {
+            const mode = String(req.query.fare_mode).trim().toLowerCase();
+
+            if (!ALL_FARE_MODES.includes(mode)) {
+                return res.status(400).json({
+                    message: `fare_mode must be one of: ${ALL_FARE_MODES.join(", ")}`,
+                    error_code: "INVALID_FARE_MODE"
+                });
+            }
+
+            params.push(mode);
+            where.push(`b.fare_mode = $${params.length}`);
+        }
 
         // "To Airport" / "From Airport". Matched on the address text, which is
         // rough, but it is what there is until addresses are structured.
@@ -258,14 +361,37 @@ const listAvailableJobs = async (req, res) => {
             where.push("(b.pickup_address ILIKE '%airport%' OR b.pickup_address ILIKE '%terminal%')");
         }
 
-        const order = req.query.sort === "soonest" || !req.query.sort
-            ? "COALESCE(b.scheduled_at, b.created_at) ASC"
-            : "b.created_at DESC";
+        // ---------------------------------------------------------------
+        // Sort
+        // ---------------------------------------------------------------
+        // "Highest fare" has to read two columns, because a fixed job carries
+        // its money in fixed_amount and a bidding job in bid_high. Sorting on
+        // either one alone would push the whole other kind of job to the
+        // bottom regardless of what it pays.
+        //
+        // NULLS LAST throughout: a job with no amount named yet — which the
+        // operator interview said is normal — belongs at the end of a list
+        // sorted by money, not at the top of it.
+        //
+        // These are fixed strings chosen by a switch, never interpolated from
+        // the query string. A sort column is not a value and cannot be a bound
+        // parameter, so the safety has to come from the value never reaching
+        // the SQL at all.
+        const SORTS = {
+            soonest: "COALESCE(b.scheduled_at, b.created_at) ASC",
+            newest: "b.created_at DESC",
+            highest_fare:
+                "COALESCE(b.bid_high, b.fixed_amount) DESC NULLS LAST, " +
+                "COALESCE(b.scheduled_at, b.created_at) ASC"
+        };
+
+        const requestedSort = String(req.query.sort || "soonest").trim().toLowerCase();
+        const sort = SORTS[requestedSort] ? requestedSort : "soonest";
 
         const result = await pool.query(
             `SELECT ${BOOKING_SELECT} ${BOOKING_JOINS}
              WHERE ${where.join(" AND ")}
-             ORDER BY ${order}
+             ORDER BY ${SORTS[sort]}
              LIMIT 50`,
             params
         );
@@ -273,9 +399,32 @@ const listAvailableJobs = async (req, res) => {
         res.status(200).json({
             jobs: result.rows.map((b) => toBooking(b, { includeClientContact: false })),
             total: result.rows.length,
+
+            // What the list was actually filtered on, repeated back. An
+            // unrecognised sort falls back to "soonest" rather than erroring,
+            // so the screen needs to be told which one it got.
+            filters: {
+                vehicle_id: chosenVehicle ? chosenVehicle.id : null,
+                vehicle: chosenVehicle
+                    ? {
+                        id: chosenVehicle.id,
+                        registration_number: chosenVehicle.registration_number,
+                        make: chosenVehicle.make,
+                        model: chosenVehicle.model,
+                        seats: chosenVehicle.seats,
+                        luggage_large: chosenVehicle.luggage_large,
+                        luggage_small: chosenVehicle.luggage_small
+                    }
+                    : null,
+                fare_mode: req.query.fare_mode ? String(req.query.fare_mode).toLowerCase() : null,
+                direction: req.query.direction || null,
+                sort
+            },
+
             // Said plainly rather than left for the frontend to discover.
             notes: {
-                distance_filter: "Not available yet — driver location is not tracked"
+                distance_filter: "Not available yet — driver location is not tracked",
+                payment_filter: "Not available yet — bookings carry no payment method until payments are built"
             }
         });
 
