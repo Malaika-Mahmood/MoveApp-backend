@@ -71,8 +71,9 @@ const toProfile = (u) => ({
     // without having to work it out from null checks.
     onboarding: {
         personal_info_complete: Boolean(
-            u.title && u.date_of_birth && u.postcode && u.ni_number
-        )
+            u.title && u.date_of_birth && u.postcode && u.address
+        ),
+        ni_number_complete: Boolean(u.ni_number)
     }
 });
 
@@ -133,9 +134,12 @@ const getMe = async (req, res) => {
 // and licence both carry it, which is exactly what the operator is matching
 // against. First and last name are deliberately NOT editable: those are the
 // identity the whole account was opened under.
+// PATCH /api/v1/drivers/me/personal
+// Title, middle name, date of birth, address, postcode.
+// NI number is NOT collected here — use PATCH /api/v1/drivers/me/ni-number
 const updatePersonalInfo = async (req, res) => {
     try {
-        const { title, middle_name, date_of_birth, ni_number, address, postcode } = req.body;
+        const { title, middle_name, date_of_birth, address, postcode } = req.body;
 
         if (req.user.role !== "driver") {
             return res.status(403).json({
@@ -144,24 +148,14 @@ const updatePersonalInfo = async (req, res) => {
             });
         }
 
-        if (!title || !date_of_birth || !postcode || !ni_number) {
+        if (!title || !date_of_birth || !postcode || !address) {
             return res.status(400).json({
-                message: "title, date_of_birth, ni_number and postcode are required"
+                message: "title, date_of_birth, postcode and address are required"
             });
         }
 
         const cleanTitle = String(title).trim();
-        const cleanNi = normaliseNi(ni_number);
 
-        // Three different things the app might send, and they mean three
-        // different things:
-        //
-        //   key absent          leave whatever is stored alone
-        //   ""  or "   "        the driver cleared the field — store NULL
-        //   "Ahmad"             store it
-        //
-        // Without this an app that always sends every field would wipe a middle
-        // name every time the driver saved their address.
         const middleNameProvided = Object.prototype.hasOwnProperty.call(req.body, "middle_name");
         let cleanMiddleName;
 
@@ -177,8 +171,6 @@ const updatePersonalInfo = async (req, res) => {
                     });
                 }
 
-                // Letters, spaces, hyphens and apostrophes — enough for
-                // "Anne-Marie" and "O'Brien", nothing else.
                 if (!/^[\p{L}][\p{L}\s'-]*$/u.test(trimmed)) {
                     return res.status(400).json({
                         message: "middle_name may only contain letters, spaces, hyphens and apostrophes"
@@ -188,8 +180,21 @@ const updatePersonalInfo = async (req, res) => {
                 cleanMiddleName = trimmed;
             }
         }
+
         const cleanPostcode = String(postcode).trim().toUpperCase();
-        const cleanAddress = address ? String(address).trim() : null;
+        const cleanAddress = String(address).trim();
+
+        if (!cleanAddress) {
+            return res.status(400).json({
+                message: "address is required"
+            });
+        }
+
+        if (cleanAddress.length > 300) {
+            return res.status(400).json({
+                message: "address must be at most 300 characters"
+            });
+        }
 
         if (!VALID_TITLES.includes(cleanTitle)) {
             return res.status(400).json({
@@ -227,6 +232,60 @@ const updatePersonalInfo = async (req, res) => {
             });
         }
 
+        const updated = await pool.query(
+            `UPDATE users
+             SET title = $1,
+                 date_of_birth = $2,
+                 address = $3,
+                 postcode = $4,
+                 middle_name = CASE WHEN $5 THEN $6 ELSE middle_name END,
+                 updated_at = NOW()
+             WHERE id = $7
+             RETURNING *`,
+            [
+                cleanTitle,
+                date_of_birth,
+                cleanAddress,
+                cleanPostcode,
+                middleNameProvided,
+                cleanMiddleName ?? null,
+                req.user.id
+            ]
+        );
+
+        res.status(200).json({
+            message: "Personal information saved",
+            user: toProfile(updated.rows[0])
+        });
+
+    } catch (error) {
+        console.error("Error in updatePersonalInfo:", error);
+        res.status(500).json({ message: "Something went wrong while saving your information" });
+    }
+};
+// PATCH /api/v1/drivers/me/ni-number
+// Body: { "ni_number": "AB123456C" }
+// Collected on the Documents step (not Personal Information).
+const updateNiNumber = async (req, res) => {
+    try {
+        if (req.user.role !== "driver") {
+            return res.status(403).json({
+                message: "Only drivers can set a National Insurance number",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        const { ni_number } = req.body || {};
+
+        if (!ni_number) {
+            return res.status(400).json({
+                message: "ni_number is required",
+                error_code: "MISSING_NI_NUMBER"
+            });
+        }
+
+        const cleanNi = normaliseNi(ni_number);
+
         if (!NI_REGEX.test(cleanNi)) {
             return res.status(400).json({
                 message: "ni_number must be a valid UK National Insurance number (e.g. AB123456C)",
@@ -234,9 +293,6 @@ const updatePersonalInfo = async (req, res) => {
             });
         }
 
-        // One National Insurance number belongs to one person. Two accounts
-        // sharing one is either a typo or someone using another driver's
-        // identity, and neither should be allowed through quietly.
         const clash = await pool.query(
             "SELECT id FROM users WHERE UPPER(ni_number) = $1 AND id <> $2",
             [cleanNi, req.user.id]
@@ -249,23 +305,16 @@ const updatePersonalInfo = async (req, res) => {
             });
         }
 
-        // middle_name is only touched when the key was actually sent, which is
-        // why it is not a plain COALESCE like address: COALESCE could never
-        // clear it, and here clearing is a real thing a driver may want.
         const updated = await pool.query(
             `UPDATE users
-             SET title = $1, date_of_birth = $2, ni_number = $3,
-                 address = COALESCE($4, address), postcode = $5,
-                 middle_name = CASE WHEN $6 THEN $7 ELSE middle_name END,
-                 updated_at = NOW()
-             WHERE id = $8
+             SET ni_number = $1, updated_at = NOW()
+             WHERE id = $2
              RETURNING *`,
-            [cleanTitle, date_of_birth, cleanNi, cleanAddress, cleanPostcode,
-                middleNameProvided, cleanMiddleName ?? null, req.user.id]
+            [cleanNi, req.user.id]
         );
 
         res.status(200).json({
-            message: "Personal information saved",
+            message: "National Insurance number saved",
             user: toProfile(updated.rows[0])
         });
 
@@ -277,8 +326,103 @@ const updatePersonalInfo = async (req, res) => {
             });
         }
 
-        console.error("Error in updatePersonalInfo:", error);
-        res.status(500).json({ message: "Something went wrong while saving your information" });
+        console.error("Error in updateNiNumber:", error);
+        res.status(500).json({ message: "Something went wrong while saving your NI number" });
+    }
+};
+
+// GET /api/v1/drivers/me/address-lookup?postcode=SW1A1AA
+const lookupAddressByPostcode = async (req, res) => {
+    try {
+        if (req.user.role !== "driver" && req.user.role !== "operator") {
+            return res.status(403).json({
+                message: "Not allowed",
+                error_code: "FORBIDDEN"
+            });
+        }
+
+        const raw = req.query.postcode;
+        if (!raw) {
+            return res.status(400).json({
+                message: "postcode query parameter is required"
+            });
+        }
+
+        const cleanPostcode = String(raw).trim().toUpperCase().replace(/\s+/g, "");
+
+        const spaced = cleanPostcode.length > 3
+            ? `${cleanPostcode.slice(0, -3)} ${cleanPostcode.slice(-3)}`
+            : cleanPostcode;
+
+        if (!POSTCODE_REGEX.test(String(raw).trim().toUpperCase()) && !POSTCODE_REGEX.test(spaced)) {
+            return res.status(400).json({
+                message: "postcode must be a valid UK postcode (e.g. W1U 3BW)"
+            });
+        }
+
+        const apiKey = process.env.IDEAL_POSTCODES_API_KEY;
+        if (!apiKey) {
+            return res.status(503).json({
+                message: "Address lookup is not configured",
+                error_code: "ADDRESS_LOOKUP_UNAVAILABLE"
+            });
+        }
+
+        const url =
+            `https://api.ideal-postcodes.co.uk/v1/postcodes/${encodeURIComponent(cleanPostcode)}` +
+            `?api_key=${encodeURIComponent(apiKey)}`;
+
+        const response = await fetch(url);
+        const data = await response.json().catch(() => ({}));
+
+        if (response.status === 404 || (data.code && Number(data.code) === 4040)) {
+            return res.status(404).json({
+                message: "No addresses found for this postcode",
+                error_code: "POSTCODE_NOT_FOUND",
+                addresses: []
+            });
+        }
+
+        if (!response.ok) {
+            console.error("Ideal Postcodes error:", response.status, data);
+            return res.status(502).json({
+                message: "Address lookup failed. Please try again or enter the address manually.",
+                error_code: "ADDRESS_LOOKUP_FAILED"
+            });
+        }
+
+        const results = Array.isArray(data.result) ? data.result : [];
+
+        const addresses = results.map((a) => {
+            const line1 = a.line_1 || a.line1 || "";
+            const line2 = a.line_2 || a.line2 || "";
+            const line3 = a.line_3 || a.line3 || "";
+            const postTown = a.post_town || a.postTown || "";
+            const postcode = a.postcode || spaced;
+
+            const parts = [line1, line2, line3, postTown].filter(Boolean);
+
+            return {
+                line_1: line1,
+                line_2: line2 || null,
+                line_3: line3 || null,
+                post_town: postTown || null,
+                postcode,
+                formatted_address: parts.join(", ")
+            };
+        });
+
+        res.status(200).json({
+            postcode: cleanPostcode,
+            count: addresses.length,
+            addresses
+        });
+
+    } catch (error) {
+        console.error("Error in lookupAddressByPostcode:", error);
+        res.status(500).json({
+            message: "Something went wrong while looking up the address"
+        });
     }
 };
 
@@ -547,6 +691,8 @@ const decideAccessRequest = async (req, res) => {
 module.exports = {
     getMe,
     updatePersonalInfo,
+    updateNiNumber,
+    lookupAddressByPostcode,
     requestContact,
     getShareCode,
     changeSharePin,

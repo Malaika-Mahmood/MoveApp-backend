@@ -7,7 +7,11 @@ const {
     OPTIONAL_DRIVER_DOCUMENTS,
     ALL_DRIVER_DOCUMENTS,
     DOCUMENT_SOURCES,
-    DOCUMENT_LABELS
+    DOCUMENT_LABELS,
+    ADDITIONAL_DRIVER_DOCUMENTS,
+    ADDITIONAL_DOCUMENT_GROUPS,
+    MIN_ADDITIONAL_DOCUMENTS,
+    DOCUMENT_RECENCY_HINTS,
 } = require("../constants/documents");
 const { canSeeDriverContact } = require("../utils/masking");
 
@@ -25,6 +29,26 @@ const toDocument = (d) => ({
     expires_at: d.expires_at,
     uploaded_at: d.uploaded_at
 });
+
+// How far through step 2 the driver is.
+//
+// There are three kinds of document now, not two. "Required" means every one
+// of them; "optional" means none of them are needed; this third kind is a
+// COUNT — any two of nine. Neither of the other lists can express that, which
+// is why it gets its own reckoning rather than being folded into them.
+//
+// Uploaded and approved are counted separately on purpose. Uploading is enough
+// to move a driver into the review queue; only approval lets them work.
+const additionalProgress = (haveTypes) => {
+    const chosen = ADDITIONAL_DRIVER_DOCUMENTS.filter((t) => haveTypes.includes(t));
+
+    return {
+        chosen,
+        count: chosen.length,
+        remaining: Math.max(0, MIN_ADDITIONAL_DOCUMENTS - chosen.length),
+        enough: chosen.length >= MIN_ADDITIONAL_DOCUMENTS
+    };
+};
 
 // Vehicles with their current documents, in the shape the PDF builder wants
 const loadVehiclesWithDocuments = async (driverId) => {
@@ -137,7 +161,9 @@ const uploadDocument = async (req, res) => {
             [storage.buildFileUrl(doc.id), doc.id]
         );
 
-        // Are all the REQUIRED documents now present? Optional ones never count.
+        // Is everything now present? Two separate tests: every REQUIRED
+        // document, and any two of the ADDITIONAL ones. Optional documents
+        // never count towards either.
         const current = await client.query(
             `SELECT document_type FROM driver_documents
              WHERE user_id = $1 AND is_current`,
@@ -145,11 +171,16 @@ const uploadDocument = async (req, res) => {
         );
         const have = current.rows.map((r) => r.document_type);
         const missing = REQUIRED_DRIVER_DOCUMENTS.filter((t) => !have.includes(t));
-        const allUploaded = missing.length === 0;
+        const additional = additionalProgress(have);
 
-        // Move the driver into the queue once everything required is in and
-        // they have a vehicle. 'rejected' is included so a driver who
-        // re-uploads after a rejection goes back into the queue.
+        // Both halves of step 1 and step 2 have to be in before the driver is
+        // worth an operator's time. A queue entry that turns out to be missing
+        // an address proof is a review the operator has to abandon halfway.
+        const allUploaded = missing.length === 0 && additional.enough;
+
+        // Move the driver into the queue once everything is in and they have a
+        // vehicle. 'rejected' is included so a driver who re-uploads after a
+        // rejection goes back into the queue.
         if (allUploaded) {
             const vehicles = await client.query(
                 "SELECT id FROM vehicles WHERE driver_id = $1",
@@ -198,6 +229,15 @@ const uploadDocument = async (req, res) => {
             message: "Document uploaded successfully",
             document: toDocument({ ...doc, file_url: storage.buildFileUrl(doc.id) }),
             missing_documents: missing,
+
+            // So the upload screen can update its "1 of 2 selected" counter
+            // from the response it already has, without a second request.
+            additional_documents: {
+                needed: MIN_ADDITIONAL_DOCUMENTS,
+                chosen: additional.chosen,
+                remaining: additional.remaining
+            },
+
             all_documents_complete: allUploaded
         });
 
@@ -231,6 +271,7 @@ const getMyDocuments = async (req, res) => {
         const have = docs.rows.map((d) => d.document_type);
         const missingRequired = REQUIRED_DRIVER_DOCUMENTS.filter((t) => !have.includes(t));
         const missingOptional = OPTIONAL_DRIVER_DOCUMENTS.filter((t) => !have.includes(t));
+        const additional = additionalProgress(have);
         const rejected = docs.rows.filter((d) => d.status === "rejected");
 
         res.status(200).json({
@@ -243,10 +284,35 @@ const getMyDocuments = async (req, res) => {
             missing_documents: missingRequired,
             missing_optional_documents: missingOptional,
 
+            // Step 2 of the document screens.
+            //
+            // `groups` is what the app draws — two headings, with the types
+            // under each. It is sent from here rather than hard-coded in the
+            // app so the two cannot drift apart, which is the whole reason
+            // labels live on this side too.
+            //
+            // The rule the backend actually enforces is `needed`, and it does
+            // not care which group they came from: any two.
+            //
+            // `recency_hints` is the "issued within the last 3 months" line
+            // under each one. The server does not check it — the operator
+            // reads the date while approving — but both sides should at least
+            // tell the driver the same thing.
+            additional_documents: {
+                groups: ADDITIONAL_DOCUMENT_GROUPS,
+                needed: MIN_ADDITIONAL_DOCUMENTS,
+                chosen: additional.chosen,
+                remaining: additional.remaining,
+                recency_hints: DOCUMENT_RECENCY_HINTS
+            },
+
             // Documents the driver must replace, with the operator's reason
             rejected_documents: rejected.map(toDocument),
 
-            is_complete: missingRequired.length === 0,
+            // Uploaded, not approved. The app uses this to decide whether the
+            // driver may leave the document screens, not whether they can work.
+            is_complete: missingRequired.length === 0 && additional.enough,
+
             driver_status: req.user.status
         });
 

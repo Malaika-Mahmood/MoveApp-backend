@@ -4,6 +4,8 @@ const router = express.Router();
 const {
     getMe,
     updatePersonalInfo,
+    updateNiNumber,
+    lookupAddressByPostcode,
     requestContact,
     getShareCode,
     changeSharePin,
@@ -37,6 +39,8 @@ const uploadFile = require("../middleware/uploadFile");
 // Profile
 router.get("/me", authenticate, getMe);
 router.patch("/me/personal", authenticate, updatePersonalInfo);
+router.patch("/me/ni-number", authenticate, updateNiNumber);
+router.get("/me/address-lookup", authenticate, lookupAddressByPostcode);
 
 // Documents
 router.post("/me/documents", authenticate, uploadFile("file"), uploadDocument);

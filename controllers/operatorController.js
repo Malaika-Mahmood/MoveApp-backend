@@ -3,6 +3,8 @@ const { toDocument } = require("./documentController");
 const { toVehicleDocument } = require("./vehicleController");
 const {
     REQUIRED_DRIVER_DOCUMENTS,
+    ADDITIONAL_DRIVER_DOCUMENTS,
+    MIN_ADDITIONAL_DOCUMENTS,
     REQUIRED_VEHICLE_DOCUMENTS,
     DRIVER_DOCUMENTS_WITH_EXPIRY,
     VEHICLE_DOCUMENTS_WITH_EXPIRY,
@@ -88,6 +90,14 @@ const recomputeDriverStatus = async (client, driverId) => {
 
     const allPresent = REQUIRED_DRIVER_DOCUMENTS.every((t) => byType.has(t));
     const allApproved = REQUIRED_DRIVER_DOCUMENTS.every((t) => byType.get(t) === "approved");
+    const additionalUploaded = ADDITIONAL_DRIVER_DOCUMENTS
+        .filter((t) => byType.has(t)).length;
+
+    const additionalApproved = ADDITIONAL_DRIVER_DOCUMENTS
+        .filter((t) => byType.get(t) === "approved").length;
+
+    const enoughAdditionalPresent = additionalUploaded >= MIN_ADDITIONAL_DOCUMENTS;
+    const enoughAdditionalApproved = additionalApproved >= MIN_ADDITIONAL_DOCUMENTS;
     const anyDocRejected = docs.rows.some((d) => d.status === "rejected");
 
     const vehicles = await client.query(
@@ -102,11 +112,9 @@ const recomputeDriverStatus = async (client, driverId) => {
     if (anyDocRejected || anyVehicleRejected) {
         // Something needs re-uploading — the driver must be told
         status = "rejected";
-    } else if (allApproved && hasApprovedVehicle) {
-        // Everything required: all required documents approved, and one
-        // fully approved vehicle
+    } else if (allApproved && enoughAdditionalApproved && hasApprovedVehicle) {
         status = "approved";
-    } else if (allPresent && vehicles.rows.length > 0) {
+    } else if (allPresent && enoughAdditionalPresent && vehicles.rows.length > 0) {
         status = "pending_verification";
     } else {
         status = "account_created";
